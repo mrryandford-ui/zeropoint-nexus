@@ -1,0 +1,38 @@
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+**/.venv/
+**/venv/
+
+# Test/cache artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs and runtime outputs
+*.log
+logs/
+
+# Editor and OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local secrets / env
+.env
+.env.*
+config/.env
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
