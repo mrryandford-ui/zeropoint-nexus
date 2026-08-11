@@ -31,6 +31,7 @@ Thumbs.db
 .env
 .env.*
 config/.env
+**/config/.env
 
 # Build artifacts
 dist/
