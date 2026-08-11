@@ -1,0 +1,17 @@
+{
+  "cluster": "ZeroPoint-MCP",
+  "primary_head": "ZERO-FLD",
+  "policies": {
+    "tool_usage": {
+      "filesystem_write": false,
+      "adb_install_apk": true
+    },
+    "node_addition": {
+      "require_approval": false
+    }
+  },
+  "nodes": {
+    "ZERO-FLD": {"role":"head"},
+    "ZERO-DEV": {"role":"worker"}
+  }
+}

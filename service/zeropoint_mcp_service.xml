@@ -1,0 +1,12 @@
+<service>
+  <id>zeropoint-mcp</id>
+  <name>ZeroPoint MCP Service</name>
+  <description>Wrapper service to run ZeroPoint dev_start.ps1 as a Windows service via winsw</description>
+  <executable>powershell.exe</executable>
+  <arguments>-NoProfile -ExecutionPolicy Bypass -File "C:\\Users\\zeroi\\Downloads\\zeropoint-mcp\\dev_start.ps1"</arguments>
+  <env name="RAY_ADDRESS" value="127.0.0.1:6379" />
+  <env name="PROJECT_DIR" value="C:\\Users\\zeroi\\Downloads\\zeropoint-mcp" />
+  <logpath>./logs</logpath>
+  <log mode="roll">zeropoint-mcp.log</log>
+  <onfailure action="restart"/>
+</service>

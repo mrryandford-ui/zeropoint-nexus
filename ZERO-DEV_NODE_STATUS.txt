@@ -1,0 +1,14 @@
+                            eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee                 eeNode: ZERO-DEV
+node_id: dd7103b7feef4c86bba116544b94c408
+hostname: ZERO-DEV
+role: worker (configured)
+RAY_ADDRESS (configured): 192.168.0.140:6379
+MCP core: http://localhost:8765 (WebSocket: ws://localhost:8765/mcp)
+Identity MCP: http://localhost:8766
+Tool registry count (local): 18
+Ray import status: ray Python extension failed to import (native extension missing or dependencies); identity MCP falls back to TCP reachability checks.
+Ray reachability: TCP connect to 192.168.0.140:6379 failed from ZERO-DEV (timed out)
+Notes:
+- Supervisor is manual: use supervisor_manual.ps1 to start MCP core (and optionally Ray head via -StartRayHead).
+- To add more nodes: copy cluster_registry.json and governance.json entries, assign unique node_id and node_name, set RAY_ADDRESS appropriately, and start identity + MCP on the node.
+- For multi-node Ray, ensure the Ray head is accessible from worker nodes on port 6379 and that required native Ray binaries are installed on each node (MSVC runtime, proper ray wheel).

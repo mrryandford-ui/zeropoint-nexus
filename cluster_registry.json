@@ -1,0 +1,25 @@
+{
+  "cluster_name": "ZeroPoint-MCP",
+  "nodes": [
+    {
+      "identity_url": "http://192.168.0.140:8766",
+      "node_id": "307a0cc30b3d43a3b5c38712bbdff03c",
+      "role": "head",
+      "hostname": "ZERO-FLD",
+      "ray_address": "192.168.0.140:6379",
+      "node_name": "ZERO-FLD",
+      "mcp_url": "http://192.168.0.140:8765"
+    },
+    {
+      "identity_url": "http://localhost:8766",
+      "node_id": "dd7103b7feef4c86bba116544b94c408",
+      "role": "worker",
+      "hostname": "ZERO-DEV",
+      "ray_address": "192.168.0.140:6379",
+      "node_name": "ZERO-DEV",
+      "mcp_url": "http://localhost:8765"
+    }
+  ],
+  "updated": "2026-08-06T17:17:13.9311153-07:00"
+}
+

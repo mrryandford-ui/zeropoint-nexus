@@ -1,0 +1,13 @@
+2026-08-10 17:43:44,462 INFO     zeropoint.auth ù Auth token loaded from env var 'MCP_AUTH_TOKEN'.
+2026-08-10 17:43:44,466 INFO     zeropoint.registry ù ToolRegistry loaded: 0 tools across 0 modules.
+2026-08-10 17:43:44,476 INFO     zeropoint.registry ù All tools started up.
+2026-08-10 17:43:44,476 INFO     zeropoint.server ù ZeroPoint MCP server ready.
+2026-08-10 17:43:44,482 INFO     zeropoint.server ù Listening on ws://0.0.0.0:8765/mcp
+2026-08-10 17:43:44,482 INFO     zeropoint.server ù Health:   http://0.0.0.0:8765/health
+2026-08-10 17:44:02,533 INFO     aiohttp.access ù 127.0.0.1 [10/Aug/2026:17:44:02 -0700] "GET /health HTTP/1.1" 200 244 "-" "Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.26200; en-US) PowerShell/7.6.4"
+2026-08-10 18:42:47,349 INFO     aiohttp.access ù 127.0.0.1 [10/Aug/2026:18:42:47 -0700] "POST /mcp HTTP/1.1" 405 209 "-" "copilot-win32-x64/1.0.77 (win32 v24.18.0) term/unknown"
+2026-08-10 18:42:50,788 INFO     aiohttp.access ù 127.0.0.1 [10/Aug/2026:18:42:50 -0700] "POST /sse HTTP/1.1" 404 174 "-" "copilot-win32-x64/1.0.77 (win32 v24.18.0) term/unknown"
+2026-08-10 23:17:51,542 INFO     aiohttp.access ù 127.0.0.1 [10/Aug/2026:23:17:51 -0700] "POST /mcp HTTP/1.1" 405 209 "-" "copilot-win32-x64/1.0.77 (win32 v24.18.0) term/unknown"
+2026-08-10 23:17:55,728 INFO     aiohttp.access ù 127.0.0.1 [10/Aug/2026:23:17:55 -0700] "POST /sse HTTP/1.1" 404 174 "-" "copilot-win32-x64/1.0.77 (win32 v24.18.0) term/unknown"
+2026-08-10 23:22:38,468 INFO     aiohttp.access ù 127.0.0.1 [10/Aug/2026:23:22:38 -0700] "POST /mcp HTTP/1.1" 405 209 "-" "copilot-win32-x64/1.0.77 (win32 v24.18.0) term/unknown"
+2026-08-10 23:22:49,694 INFO     aiohttp.access ù 127.0.0.1 [10/Aug/2026:23:22:49 -0700] "POST /sse HTTP/1.1" 404 174 "-" "copilot-win32-x64/1.0.77 (win32 v24.18.0) term/unknown"

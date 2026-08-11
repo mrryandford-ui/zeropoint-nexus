@@ -1,0 +1,5259 @@
+========================================================================
+FILE: android/camnet_controller.py
+========================================================================
+#!/usr/bin/env python3
+"""
+ZeroPoint CamNet — Android Multi-Device Automation Controller
+Manages a fleet of Android devices (CamNet nodes) for synchronized
+capture, monitoring, and media synchronization.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import uiautomator2 as u2
+import yaml
+
+logger = logging.getLogger(__name__)
+
+###############################################################################
+# Data Models
+###############################################################################
+
+@dataclass
+class DeviceInfo:
+    device_id: str
+    serial: str
+    role: str
+    label: str
+    tags: list[str] = field(default_factory=list)
+    # Live state (populated after connect)
+    connected: bool = False
+    battery_pct: int = -1
+    storage_free_gb: float = -1.0
+    android_version: str = ""
+    last_seen: datetime | None = None
+    _d: Any = field(default=None, repr=False)   # uiautomator2 Device handle
+
+    def to_dict(self) -> dict:
+        return {
+            "device_id": self.device_id,
+            "serial": self.serial,
+            "role": self.role,
+            "label": self.label,
+            "tags": self.tags,
+            "connected": self.connected,
+            "battery_pct": self.battery_pct,
+            "storage_free_gb": round(self.storage_free_gb, 2),
+            "android_version": self.android_version,
+            "last_seen": self.last_seen.isoformat() if self.last_seen else None,
+        }
+
+
+@dataclass
+class CaptureResult:
+    device_id: str
+    local_path: str | None
+    timestamp: datetime
+    success: bool
+    error: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "device_id": self.device_id,
+            "local_path": self.local_path,
+            "timestamp": self.timestamp.isoformat(),
+            "success": self.success,
+            "error": self.error,
+        }
+
+
+###############################################################################
+# CamNet Controller
+###############################################################################
+
+class CamNetController:
+    """
+    Orchestrates multiple Android devices as a synchronized camera network.
+
+    Usage:
+        ctrl = CamNetController.from_config("/workspace/zeropoint/config/mcp_server_config.yaml")
+        asyncio.run(ctrl.connect_all())
+        results = asyncio.run(ctrl.capture_all(mode="photo"))
+    """
+
+    def __init__(
+        self,
+        devices: list[DeviceInfo],
+        screenshot_dir: Path,
+        video_dir: Path,
+        network_id: str = "camnet-0",
+        coordinator_host: str = "192.168.100.1",
+        coordinator_port: int = 9000,
+        sync_interval_seconds: int = 5,
+    ):
+        self.devices: dict[str, DeviceInfo] = {d.device_id: d for d in devices}
+        self.screenshot_dir = Path(screenshot_dir)
+        self.video_dir = Path(video_dir)
+        self.network_id = network_id
+        self.coordinator_host = coordinator_host
+        self.coordinator_port = coordinator_port
+        self.sync_interval_seconds = sync_interval_seconds
+        self._lock = asyncio.Lock()
+
+        self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+        self.video_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Factory
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_config(cls, config_path: str | Path) -> "CamNetController":
+        """Instantiate from mcp_server_config.yaml."""
+        cfg = yaml.safe_load(Path(config_path).read_text())
+        android_cfg = cfg["tools"]["android"]["config"]
+        camnet_cfg = android_cfg["camnet"]
+        raw_devices = cfg.get("android_devices", [])
+
+        devices = [
+            DeviceInfo(
+                device_id=d["id"],
+                serial=d["serial"],
+                role=d.get("role", "secondary"),
+                label=d.get("label", d["id"]),
+                tags=d.get("tags", []),
+            )
+            for d in raw_devices
+        ]
+
+        return cls(
+            devices=devices,
+            screenshot_dir=android_cfg["screenshot_dir"],
+            video_dir=android_cfg["video_dir"],
+            network_id=camnet_cfg["network_id"],
+            coordinator_host=camnet_cfg["coordinator_host"],
+            coordinator_port=camnet_cfg["coordinator_port"],
+            sync_interval_seconds=camnet_cfg["sync_interval_seconds"],
+        )
+
+    # ------------------------------------------------------------------
+    # Device Management
+    # ------------------------------------------------------------------
+
+    def _get_devices(self, device_ids: list[str] | None) -> list[DeviceInfo]:
+        if not device_ids:
+            return list(self.devices.values())
+        return [self.devices[did] for did in device_ids if did in self.devices]
+
+    async def connect_device(self, dev: DeviceInfo) -> bool:
+        """Connect to a single device via uiautomator2 over network ADB."""
+        loop = asyncio.get_event_loop()
+        try:
+            d = await loop.run_in_executor(None, u2.connect, dev.serial)
+            dev._d = d
+            dev.connected = True
+            dev.last_seen = datetime.now(timezone.utc)
+
+            info = await loop.run_in_executor(None, lambda: d.device_info)
+            dev.android_version = info.get("sdkInt", "")
+            batt = await loop.run_in_executor(None, lambda: d.battery.get_info())
+            dev.battery_pct = batt.get("level", -1)
+
+            logger.info("Connected to %s (%s)", dev.label, dev.serial)
+            return True
+        except Exception as exc:
+            dev.connected = False
+            logger.warning("Failed to connect %s: %s", dev.serial, exc)
+            return False
+
+    async def connect_all(self, device_ids: list[str] | None = None) -> dict[str, bool]:
+        """Connect to all (or specified) devices concurrently."""
+        targets = self._get_devices(device_ids)
+        tasks = [self.connect_device(dev) for dev in targets]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        return {dev.device_id: ok for dev, ok in zip(targets, results)}
+
+    async def disconnect_all(self) -> None:
+        for dev in self.devices.values():
+            dev.connected = False
+            dev._d = None
+        logger.info("All devices disconnected.")
+
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
+
+    async def status(self, device_ids: list[str] | None = None) -> dict:
+        """Return live status of all devices."""
+        targets = self._get_devices(device_ids)
+        loop = asyncio.get_event_loop()
+
+        async def _refresh(dev: DeviceInfo):
+            if dev._d and dev.connected:
+                try:
+                    batt = await loop.run_in_executor(None, lambda: dev._d.battery.get_info())
+                    dev.battery_pct = batt.get("level", dev.battery_pct)
+                    dev.last_seen = datetime.now(timezone.utc)
+                except Exception:
+                    dev.connected = False
+
+        await asyncio.gather(*[_refresh(d) for d in targets])
+        active = sum(1 for d in targets if d.connected)
+
+        return {
+            "network_id": self.network_id,
+            "active_count": active,
+            "devices": [d.to_dict() for d in targets],
+        }
+
+    # ------------------------------------------------------------------
+    # Capture
+    # ------------------------------------------------------------------
+
+    async def _capture_photo(self, dev: DeviceInfo, save_dir: Path) -> CaptureResult:
+        ts = datetime.now(timezone.utc)
+        loop = asyncio.get_event_loop()
+        filename = f"{dev.device_id}_{ts.strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+        local_path = save_dir / dev.device_id / filename
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Launch camera, take photo, pull file
+            d = dev._d
+            await loop.run_in_executor(
+                None,
+                lambda: d.shell("am start -a android.media.action.STILL_IMAGE_CAMERA")
+            )
+            await asyncio.sleep(1.5)  # allow camera to open
+
+            # Trigger shutter via keycode (KEYCODE_CAMERA = 27)
+            await loop.run_in_executor(None, lambda: d.shell("input keyevent 27"))
+            await asyncio.sleep(2.0)  # allow photo save
+
+            # Find latest DCIM image and pull it
+            result = await loop.run_in_executor(
+                None,
+                lambda: d.shell(
+                    "ls -t /sdcard/DCIM/Camera/*.jpg 2>/dev/null | head -1"
+                )
+            )
+            remote_path = result.output.strip()
+            if not remote_path:
+                raise RuntimeError("No photo found in DCIM/Camera/")
+
+            await loop.run_in_executor(
+                None, lambda: d.pull(remote_path, str(local_path))
+            )
+            dev.last_seen = datetime.now(timezone.utc)
+            return CaptureResult(dev.device_id, str(local_path), ts, True)
+        except Exception as exc:
+            logger.error("Capture failed on %s: %s", dev.device_id, exc)
+            return CaptureResult(dev.device_id, None, ts, False, str(exc))
+
+    async def _capture_screencap(self, dev: DeviceInfo) -> CaptureResult:
+        ts = datetime.now(timezone.utc)
+        loop = asyncio.get_event_loop()
+        filename = f"{dev.device_id}_{ts.strftime('%Y%m%d_%H%M%S_%f')}.png"
+        local_path = self.screenshot_dir / dev.device_id / filename
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            img = await loop.run_in_executor(None, dev._d.screenshot)
+            await loop.run_in_executor(None, lambda: img.save(str(local_path)))
+            dev.last_seen = datetime.now(timezone.utc)
+            return CaptureResult(dev.device_id, str(local_path), ts, True)
+        except Exception as exc:
+            logger.error("Screencap failed on %s: %s", dev.device_id, exc)
+            return CaptureResult(dev.device_id, None, ts, False, str(exc))
+
+    async def capture_all(
+        self,
+        device_ids: list[str] | None = None,
+        mode: str = "photo",
+        synchronized: bool = True,
+    ) -> list[CaptureResult]:
+        """
+        Trigger capture on all (or specified) connected devices.
+
+        mode: 'photo' | 'screencap'
+        synchronized: if True, fire all devices simultaneously via gather()
+        """
+        targets = [d for d in self._get_devices(device_ids) if d.connected]
+        if not targets:
+            logger.warning("No connected devices to capture.")
+            return []
+
+        save_dir = self.screenshot_dir if mode == "screencap" else (
+            self.screenshot_dir.parent / "photos"
+        )
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        async def _one(dev: DeviceInfo) -> CaptureResult:
+            if mode == "screencap":
+                return await self._capture_screencap(dev)
+            else:
+                return await self._capture_photo(dev, save_dir)
+
+        if synchronized:
+            results = await asyncio.gather(*[_one(d) for d in targets])
+        else:
+            results = []
+            for dev in targets:
+                results.append(await _one(dev))
+
+        ok = sum(1 for r in results if r.success)
+        logger.info("Capture complete: %d/%d succeeded.", ok, len(results))
+        return list(results)
+
+    # ------------------------------------------------------------------
+    # Media Sync
+    # ------------------------------------------------------------------
+
+    async def sync_media(
+        self,
+        device_ids: list[str] | None = None,
+        media_type: str = "all",
+        delete_after_sync: bool = False,
+        destination: str | None = None,
+    ) -> dict:
+        """Pull media from devices to coordinator storage."""
+        targets = [d for d in self._get_devices(device_ids) if d.connected]
+        dest = Path(destination or self.screenshot_dir.parent / "sync")
+        today = datetime.now().strftime("%Y-%m-%d")
+        dest_day = dest / today
+        dest_day.mkdir(parents=True, exist_ok=True)
+
+        loop = asyncio.get_event_loop()
+        total_files = 0
+        total_bytes = 0
+        errors: list[str] = []
+
+        async def _sync_one(dev: DeviceInfo):
+            nonlocal total_files, total_bytes
+            try:
+                patterns = []
+                if media_type in ("all", "photo"):
+                    patterns.append("/sdcard/DCIM/Camera/*.jpg")
+                if media_type in ("all", "video"):
+                    patterns.append("/sdcard/DCIM/Camera/*.mp4")
+
+                for pattern in patterns:
+                    ls = await loop.run_in_executor(
+                        None,
+                        lambda p=pattern: dev._d.shell(f"ls {p} 2>/dev/null").output
+                    )
+                    for remote_file in ls.strip().splitlines():
+                        remote_file = remote_file.strip()
+                        if not remote_file:
+                            continue
+                        fname = Path(remote_file).name
+                        local_path = dest_day / dev.device_id / fname
+                        local_path.parent.mkdir(parents=True, exist_ok=True)
+                        await loop.run_in_executor(
+                            None, lambda r=remote_file, l=local_path: dev._d.pull(r, str(l))
+                        )
+                        total_files += 1
+                        total_bytes += local_path.stat().st_size
+                        if delete_after_sync:
+                            await loop.run_in_executor(
+                                None,
+                                lambda r=remote_file: dev._d.shell(f"rm -f {r}")
+                            )
+                dev.last_seen = datetime.now(timezone.utc)
+            except Exception as exc:
+                errors.append(f"{dev.device_id}: {exc}")
+                logger.error("Sync error on %s: %s", dev.device_id, exc)
+
+        await asyncio.gather(*[_sync_one(d) for d in targets])
+
+        return {
+            "synced_files": total_files,
+            "bytes_transferred": total_bytes,
+            "destination": str(dest_day),
+            "errors": errors,
+        }
+
+    # ------------------------------------------------------------------
+    # UI Automation Helpers
+    # ------------------------------------------------------------------
+
+    async def tap(
+        self,
+        device_id: str,
+        x: float | None = None,
+        y: float | None = None,
+        selector: dict | None = None,
+        wait_seconds: float = 5.0,
+    ) -> dict:
+        dev = self.devices.get(device_id)
+        if not dev or not dev.connected:
+            return {"tapped": False, "element_found": False, "error": "Device not connected"}
+
+        loop = asyncio.get_event_loop()
+        try:
+            d = dev._d
+            if selector:
+                el = d(**selector)
+                found = await loop.run_in_executor(
+                    None, lambda: el.wait(timeout=wait_seconds)
+                )
+                if found:
+                    await loop.run_in_executor(None, el.click)
+                return {"tapped": found, "element_found": found}
+            elif x is not None and y is not None:
+                await loop.run_in_executor(None, lambda: d.click(x, y))
+                return {"tapped": True, "element_found": True}
+        except Exception as exc:
+            return {"tapped": False, "element_found": False, "error": str(exc)}
+
+        return {"tapped": False, "element_found": False}
+
+    async def input_text(
+        self,
+        device_id: str,
+        text: str,
+        clear_first: bool = True,
+    ) -> dict:
+        dev = self.devices.get(device_id)
+        if not dev or not dev.connected:
+            return {"success": False, "error": "Device not connected"}
+
+        loop = asyncio.get_event_loop()
+        try:
+            d = dev._d
+            if clear_first:
+                await loop.run_in_executor(None, lambda: d.clear_text())
+            await loop.run_in_executor(None, lambda: d.send_keys(text))
+            return {"success": True}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    async def swipe(
+        self,
+        device_id: str,
+        start_x: float,
+        start_y: float,
+        end_x: float,
+        end_y: float,
+        duration_ms: int = 300,
+    ) -> dict:
+        dev = self.devices.get(device_id)
+        if not dev or not dev.connected:
+            return {"success": False, "error": "Device not connected"}
+
+        loop = asyncio.get_event_loop()
+        try:
+            d = dev._d
+            await loop.run_in_executor(
+                None,
+                lambda: d.swipe(start_x, start_y, end_x, end_y, duration=duration_ms / 1000)
+            )
+            return {"success": True}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+
+###############################################################################
+# CLI Entry Point
+###############################################################################
+
+if __name__ == "__main__":
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description="ZeroPoint CamNet Controller CLI")
+    parser.add_argument("--config", default="/workspace/zeropoint/config/mcp_server_config.yaml")
+    sub = parser.add_subparsers(dest="cmd")
+
+    sub.add_parser("status", help="Print device status")
+    cap = sub.add_parser("capture", help="Trigger capture")
+    cap.add_argument("--mode", choices=["photo", "screencap"], default="photo")
+    cap.add_argument("--devices", nargs="*")
+
+    syn = sub.add_parser("sync", help="Sync media from devices")
+    syn.add_argument("--devices", nargs="*")
+    syn.add_argument("--delete-after", action="store_true")
+
+    args = parser.parse_args()
+
+    async def main():
+        ctrl = CamNetController.from_config(args.config)
+        await ctrl.connect_all()
+
+        if args.cmd == "status":
+            result = await ctrl.status()
+        elif args.cmd == "capture":
+            results = await ctrl.capture_all(device_ids=args.devices, mode=args.mode)
+            result = {"captures": [r.to_dict() for r in results]}
+        elif args.cmd == "sync":
+            result = await ctrl.sync_media(
+                device_ids=args.devices,
+                delete_after_sync=args.delete_after,
+            )
+        else:
+            parser.print_help()
+            return
+
+        print(json.dumps(result, indent=2, default=str))
+
+    asyncio.run(main())
+
+
+========================================================================
+FILE: zeropoint/__init__.py
+========================================================================
+"""ZeroPoint MCP Server — Python package root."""
+
+__version__ = "1.0.0"
+__author__ = "ZeroPoint"
+
+
+========================================================================
+FILE: zeropoint/auth.py
+========================================================================
+"""
+Bearer-token authentication middleware for the ZeroPoint MCP WebSocket server.
+
+Flow:
+  1. Client connects and sends an MCP `initialize` request.
+  2. Server validates the `Authorization: Bearer <token>` header before
+     upgrading to WebSocket.  Connections without a valid token are
+     rejected with HTTP 401.
+  3. After the handshake the connection is trusted for its lifetime.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import logging
+import os
+import secrets
+import time
+from dataclasses import dataclass
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+###############################################################################
+# Config
+###############################################################################
+
+@dataclass
+class AuthConfig:
+    enabled: bool = True
+    method: str = "bearer_token"    # bearer_token | none
+    token_env: str = "MCP_AUTH_TOKEN"
+    rate_limit_per_minute: int = 120
+
+
+###############################################################################
+# BearerTokenAuth
+###############################################################################
+
+class BearerTokenAuth:
+    """
+    Validates bearer tokens for incoming MCP connections.
+
+    Token is read once from the environment variable named in `token_env`.
+    Comparison is constant-time to prevent timing attacks.
+    """
+
+    def __init__(self, cfg: AuthConfig):
+        self.cfg = cfg
+        self._token: str | None = None
+        self._token_hash: bytes | None = None
+        self._failed_attempts: dict[str, list[float]] = {}  # ip -> timestamps
+        if cfg.enabled:
+            self._load_token()
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def _load_token(self) -> None:
+        raw = os.environ.get(self.cfg.token_env, "").strip()
+        if not raw:
+            logger.critical(
+                "Auth is ENABLED but %s is not set. "
+                "Set the env var or disable auth in config.",
+                self.cfg.token_env,
+            )
+            raise RuntimeError(
+                f"Missing required env var: {self.cfg.token_env}"
+            )
+        # Store hash only — never keep the plaintext in memory longer than needed
+        self._token_hash = hashlib.sha256(raw.encode()).digest()
+        logger.info("Auth token loaded from env var '%s'.", self.cfg.token_env)
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def validate_header(self, authorization: str | None, peer_ip: str = "unknown") -> bool:
+        """
+        Validate an HTTP `Authorization` header value.
+
+        Args:
+            authorization: Raw header value, e.g. "Bearer abc123".
+            peer_ip:       Client IP for rate-limit tracking.
+
+        Returns:
+            True if the token is valid (or auth is disabled).
+        """
+        if not self.cfg.enabled:
+            return True
+
+        if not authorization:
+            logger.warning("Auth: missing Authorization header from %s", peer_ip)
+            return False
+
+        parts = authorization.split(" ", 1)
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            logger.warning("Auth: malformed Authorization header from %s", peer_ip)
+            return False
+
+        candidate = parts[1].strip()
+
+        if self._is_rate_limited(peer_ip):
+            logger.warning("Auth: rate limit exceeded for %s", peer_ip)
+            return False
+
+        candidate_hash = hashlib.sha256(candidate.encode()).digest()
+        valid = hmac.compare_digest(candidate_hash, self._token_hash)  # type: ignore[arg-type]
+
+        if not valid:
+            self._record_failure(peer_ip)
+            logger.warning("Auth: invalid token from %s", peer_ip)
+        else:
+            logger.debug("Auth: accepted connection from %s", peer_ip)
+
+        return valid
+
+    # ------------------------------------------------------------------
+    # Rate limiting (simple sliding window)
+    # ------------------------------------------------------------------
+
+    def _is_rate_limited(self, ip: str) -> bool:
+        now = time.monotonic()
+        window = 60.0
+        attempts = self._failed_attempts.get(ip, [])
+        recent = [t for t in attempts if now - t < window]
+        self._failed_attempts[ip] = recent
+        limit = self.cfg.rate_limit_per_minute // 10  # 10% of normal limit for failures
+        return len(recent) >= limit
+
+    def _record_failure(self, ip: str) -> None:
+        self._failed_attempts.setdefault(ip, []).append(time.monotonic())
+
+    # ------------------------------------------------------------------
+    # Token generation helper (used in dev_start.sh / first-run)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def generate_token(length: int = 48) -> str:
+        """Generate a cryptographically strong random bearer token."""
+        return secrets.token_urlsafe(length)
+
+
+###############################################################################
+# Factory
+###############################################################################
+
+def build_auth(config: dict[str, Any]) -> BearerTokenAuth | None:
+    """
+    Build an auth handler from the server config dict.
+
+    config: the `server.auth` block from mcp_server_config.yaml
+    """
+    auth_cfg = AuthConfig(
+        enabled=config.get("enabled", True),
+        method=config.get("method", "bearer_token"),
+        token_env=config.get("token_env", "MCP_AUTH_TOKEN"),
+    )
+    if not auth_cfg.enabled:
+        logger.info("Auth is DISABLED — all connections accepted.")
+        return None
+    return BearerTokenAuth(auth_cfg)
+
+
+========================================================================
+FILE: zeropoint/control_plane/__init__.py
+========================================================================
+"""ZeroPoint Unified Control Plane sub-package."""
+from zeropoint.control_plane.control_plane import ZeroPointControlPlane
+from zeropoint.control_plane.ai_orchestrator import AIOrchestrator
+
+__all__ = ["ZeroPointControlPlane", "AIOrchestrator"]
+
+
+========================================================================
+FILE: zeropoint/control_plane/ai_orchestrator.py
+========================================================================
+"""
+ZeroPoint Distributed AI Orchestrator
+Routes AI workloads across the Ray cluster:
+  - Text inference (local model or API)
+  - Embedding generation
+  - Async task queuing with priority
+  - Result caching
+  - CamNet image analysis
+  - OSINT summarization
+  - IT triage classification
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+logger = logging.getLogger("zeropoint.ai_orchestrator")
+
+
+###############################################################################
+# Task types
+###############################################################################
+
+TASK_TYPES = {
+    "classify_it_issue":    "Classify an IT issue description into a category.",
+    "summarize_osint":      "Summarize OSINT findings for a target.",
+    "analyze_image":        "Analyze a CamNet screenshot or capture.",
+    "generate_report":      "Generate a structured report from raw data.",
+    "extract_iocs":         "Extract indicators of compromise from text.",
+    "triage_alert":         "Triage a security alert and suggest response.",
+    "translate_text":       "Translate text to a target language.",
+    "embed_text":           "Generate a text embedding vector.",
+}
+
+
+###############################################################################
+# Result + Task dataclasses
+###############################################################################
+
+@dataclass
+class AITask:
+    task_id: str
+    task_type: str
+    payload: dict[str, Any]
+    priority: int = 5              # 1 (highest) – 10 (lowest)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    result: dict | None = None
+    completed_at: datetime | None = None
+    error: str | None = None
+
+    @property
+    def done(self) -> bool:
+        return self.result is not None or self.error is not None
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "task_type": self.task_type,
+            "priority": self.priority,
+            "created_at": self.created_at.isoformat(),
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "done": self.done,
+            "result": self.result,
+            "error": self.error,
+        }
+
+
+###############################################################################
+# LRU cache
+###############################################################################
+
+class _LRUCache:
+    def __init__(self, maxsize: int = 256):
+        self._cache: OrderedDict[str, Any] = OrderedDict()
+        self._maxsize = maxsize
+
+    def get(self, key: str) -> Any | None:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+
+    def set(self, key: str, value: Any) -> None:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        self._cache[key] = value
+        if len(self._cache) > self._maxsize:
+            self._cache.popitem(last=False)
+
+    def key_for(self, task_type: str, payload: dict) -> str:
+        blob = json.dumps({"type": task_type, "payload": payload}, sort_keys=True)
+        return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+###############################################################################
+# AIOrchestrator
+###############################################################################
+
+class AIOrchestrator:
+    """
+    Distributed AI task orchestrator backed by Ray.
+
+    If Ray is unavailable, falls back to local async execution.
+    Results are cached with an LRU cache to avoid redundant inference.
+
+    Supported backends (in priority order):
+      1. Ray remote actors   — distributed cluster execution
+      2. Local async         — single-node fallback
+    """
+
+    def __init__(self, ray_config: dict[str, Any] | None = None):
+        self._ray_cfg = ray_config or {}
+        self._cache = _LRUCache(maxsize=512)
+        self._tasks: dict[str, AITask] = {}
+        self._counter = 0
+        self._ray_available = False
+        self._semaphore = asyncio.Semaphore(8)   # max 8 concurrent local AI tasks
+
+    async def startup(self) -> None:
+        try:
+            import ray
+            if not ray.is_initialized():
+                ray.init(
+                    address=self._ray_cfg.get("head_node", "auto"),
+                    namespace=self._ray_cfg.get("namespace", "zeropoint"),
+                    ignore_reinit_error=True,
+                    logging_level=logging.WARNING,
+                )
+            self._ray_available = True
+            logger.info("AI Orchestrator: Ray backend active.")
+        except Exception as exc:
+            logger.warning("AI Orchestrator: Ray unavailable (%s) — using local fallback.", exc)
+            self._ray_available = False
+
+    async def shutdown(self) -> None:
+        logger.info("AI Orchestrator shutdown.")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def submit(
+        self,
+        task_type: str,
+        payload: dict[str, Any],
+        priority: int = 5,
+        use_cache: bool = True,
+    ) -> dict:
+        """
+        Submit an AI task. Returns result dict immediately (awaits completion).
+        For fire-and-forget, use submit_async().
+        """
+        if task_type not in TASK_TYPES:
+            return {"error": f"Unknown task_type '{task_type}'. Options: {list(TASK_TYPES)}"}
+
+        # Cache check
+        cache_key = self._cache.key_for(task_type, payload)
+        if use_cache:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                logger.debug("Cache hit for %s", task_type)
+                return {**cached, "_cached": True}
+
+        self._counter += 1
+        task = AITask(
+            task_id=f"AIT-{self._counter:05d}",
+            task_type=task_type,
+            payload=payload,
+            priority=priority,
+        )
+        self._tasks[task.task_id] = task
+
+        try:
+            async with self._semaphore:
+                if self._ray_available:
+                    result = await self._execute_ray(task)
+                else:
+                    result = await self._execute_local(task)
+        except Exception as exc:
+            task.error = str(exc)
+            task.completed_at = datetime.now(timezone.utc)
+            return {"task_id": task.task_id, "error": str(exc)}
+
+        task.result = result
+        task.completed_at = datetime.now(timezone.utc)
+
+        if use_cache and not task.error:
+            self._cache.set(cache_key, result)
+
+        return {"task_id": task.task_id, **result}
+
+    async def submit_async(self, task_type: str, payload: dict, priority: int = 5) -> str:
+        """Fire-and-forget — returns task_id immediately."""
+        self._counter += 1
+        task = AITask(f"AIT-{self._counter:05d}", task_type, payload, priority)
+        self._tasks[task.task_id] = task
+        asyncio.create_task(self._run_task(task))
+        return task.task_id
+
+    async def get_task(self, task_id: str) -> dict | None:
+        t = self._tasks.get(task_id)
+        return t.to_dict() if t else None
+
+    def list_tasks(self, done: bool | None = None) -> list[dict]:
+        tasks = self._tasks.values()
+        if done is not None:
+            tasks = [t for t in tasks if t.done == done]
+        return [t.to_dict() for t in sorted(tasks, key=lambda t: t.created_at, reverse=True)]
+
+    # ------------------------------------------------------------------
+    # Ray execution
+    # ------------------------------------------------------------------
+
+    async def _execute_ray(self, task: AITask) -> dict:
+        """Offload task to Ray cluster via remote function."""
+        import ray
+
+        @ray.remote
+        def _ray_task(task_type: str, payload: dict) -> dict:
+            # Runs inside Ray worker — import here to avoid pickling issues
+            import asyncio
+            orchestrator = AIOrchestrator.__new__(AIOrchestrator)
+            orchestrator._ray_available = False
+            orchestrator._semaphore = asyncio.Semaphore(1)
+            orchestrator._cache = _LRUCache()
+            orchestrator._tasks = {}
+            orchestrator._counter = 0
+            loop = asyncio.new_event_loop()
+            return loop.run_until_complete(orchestrator._execute_local(
+                AITask(task_id="ray-sub", task_type=task_type, payload=payload)
+            ))
+
+        loop = asyncio.get_event_loop()
+        ref = _ray_task.remote(task.task_type, task.payload)
+        result = await loop.run_in_executor(None, ray.get, ref)
+        return result
+
+    async def _run_task(self, task: AITask) -> None:
+        try:
+            async with self._semaphore:
+                result = await self._execute_local(task)
+            task.result = result
+        except Exception as exc:
+            task.error = str(exc)
+        task.completed_at = datetime.now(timezone.utc)
+
+    # ------------------------------------------------------------------
+    # Local execution — task handlers
+    # ------------------------------------------------------------------
+
+    async def _execute_local(self, task: AITask) -> dict:
+        handlers = {
+            "classify_it_issue":  self._handle_classify_it,
+            "summarize_osint":    self._handle_summarize_osint,
+            "analyze_image":      self._handle_analyze_image,
+            "generate_report":    self._handle_generate_report,
+            "extract_iocs":       self._handle_extract_iocs,
+            "triage_alert":       self._handle_triage_alert,
+            "translate_text":     self._handle_translate,
+            "embed_text":         self._handle_embed,
+        }
+        handler = handlers.get(task.task_type, self._handle_unknown)
+        return await handler(task.payload)
+
+    async def _handle_classify_it(self, payload: dict) -> dict:
+        description = payload.get("description", "")
+        keywords = {
+            "network":   ["network", "ping", "dns", "internet", "connectivity", "offline"],
+            "disk":      ["disk", "space", "full", "storage"],
+            "memory":    ["memory", "ram", "oom", "slow"],
+            "service":   ["service", "crash", "stopped", "failed", "daemon"],
+            "security":  ["breach", "unauthorized", "malware", "virus", "attack"],
+            "device":    ["device", "android", "adb", "disconnected", "phone"],
+            "auth":      ["login", "password", "auth", "permission", "access denied"],
+        }
+        desc_lower = description.lower()
+        scores = {
+            cat: sum(1 for kw in kws if kw in desc_lower)
+            for cat, kws in keywords.items()
+        }
+        best = max(scores, key=scores.get) if any(scores.values()) else "unknown"
+        return {
+            "classification": best,
+            "confidence": min(scores.get(best, 0) / 3.0, 1.0),
+            "all_scores": scores,
+            "method": "keyword_heuristic",
+        }
+
+    async def _handle_summarize_osint(self, payload: dict) -> dict:
+        results = payload.get("results", [])
+        target = payload.get("target", "unknown")
+
+        modules_run = [r.get("module", "?") for r in results]
+        errors = [r for r in results if r.get("error")]
+        open_ports = []
+        subdomains = []
+
+        for r in results:
+            data = r.get("data", {})
+            if r.get("module") == "port_scan_active":
+                open_ports = data.get("open_ports", [])
+            if r.get("module") in ("cert_transparency", "subdomains_active"):
+                subdomains.extend(data.get("subdomains_found", data.get("found", [])))
+
+        summary = (
+            f"OSINT scan of '{target}' completed {len(modules_run)} modules. "
+            f"Found {len(set(subdomains))} unique subdomains, "
+            f"{len(open_ports)} open ports. "
+            f"{len(errors)} module(s) encountered errors."
+        )
+        return {
+            "target": target,
+            "summary": summary,
+            "modules_run": modules_run,
+            "open_ports": open_ports,
+            "subdomains_sample": sorted(set(subdomains))[:20],
+            "error_count": len(errors),
+        }
+
+    async def _handle_analyze_image(self, payload: dict) -> dict:
+        """
+        Placeholder for CamNet image analysis.
+        In production, swap the body for a call to a vision model
+        (e.g. LLaVA via llama.cpp, or a cloud vision API).
+        """
+        image_path = payload.get("image_path", "")
+        return {
+            "image_path": image_path,
+            "analysis": "Vision model not configured — plug in LLaVA or cloud vision API.",
+            "status": "stub",
+        }
+
+    async def _handle_generate_report(self, payload: dict) -> dict:
+        data = payload.get("data", {})
+        report_type = payload.get("report_type", "generic")
+        lines = [
+            f"# ZeroPoint Report — {report_type.upper()}",
+            f"Generated: {datetime.now(timezone.utc).isoformat()}",
+            "",
+        ]
+        for key, val in data.items():
+            lines.append(f"## {key.replace('_', ' ').title()}")
+            lines.append(str(val))
+            lines.append("")
+        return {"report": "\n".join(lines), "report_type": report_type}
+
+    async def _handle_extract_iocs(self, payload: dict) -> dict:
+        import re
+        text = payload.get("text", "")
+        patterns = {
+            "ipv4":   r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+            "domain": r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b",
+            "md5":    r"\b[a-fA-F0-9]{32}\b",
+            "sha256": r"\b[a-fA-F0-9]{64}\b",
+            "email":  r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+            "url":    r"https?://[^\s<>\"{}|\\^`\[\]]+",
+            "cve":    r"CVE-\d{4}-\d{4,7}",
+        }
+        iocs: dict[str, list] = {}
+        for ioc_type, pattern in patterns.items():
+            found = list(set(re.findall(pattern, text)))
+            if found:
+                iocs[ioc_type] = found
+        return {"iocs": iocs, "total": sum(len(v) for v in iocs.values())}
+
+    async def _handle_triage_alert(self, payload: dict) -> dict:
+        alert = payload.get("alert", {})
+        severity = alert.get("severity", "medium")
+        source = alert.get("source", "unknown")
+
+        priority_map = {"critical": 1, "high": 2, "medium": 3, "low": 4, "info": 5}
+        priority = priority_map.get(severity, 3)
+
+        actions = []
+        if severity in ("critical", "high"):
+            actions += ["isolate_affected_system", "notify_security_team", "preserve_logs"]
+        elif severity == "medium":
+            actions += ["investigate_source", "monitor_for_recurrence"]
+        else:
+            actions += ["log_and_monitor"]
+
+        return {
+            "triage_priority": priority,
+            "recommended_actions": actions,
+            "source": source,
+            "severity": severity,
+            "auto_escalate": severity in ("critical", "high"),
+        }
+
+    async def _handle_translate(self, payload: dict) -> dict:
+        return {
+            "note": "Translation model not configured — integrate with local or cloud NMT.",
+            "source_text": payload.get("text", "")[:100],
+            "target_language": payload.get("target_language", "en"),
+            "status": "stub",
+        }
+
+    async def _handle_embed(self, payload: dict) -> dict:
+        text = payload.get("text", "")
+        # Deterministic stub — replace with sentence-transformers in production
+        h = int(hashlib.sha256(text.encode()).hexdigest(), 16)
+        vec = [(((h >> i) & 0xFF) / 255.0 - 0.5) for i in range(0, 384 * 8, 8)]
+        return {
+            "embedding": vec[:384],
+            "dimensions": 384,
+            "model": "stub_sha256_384d",
+            "note": "Replace with sentence-transformers or text-embedding-ada-002 in production.",
+        }
+
+    async def _handle_unknown(self, payload: dict) -> dict:
+        return {"error": "No handler for this task type.", "payload_keys": list(payload.keys())}
+
+
+========================================================================
+FILE: zeropoint/control_plane/control_plane.py
+========================================================================
+"""
+ZeroPoint Unified Control Plane
+Single entry point that wires together all ZeroPoint subsystems:
+MCP server, Ray cluster, IT support, OSINT, pentest, and CamNet.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+logger = logging.getLogger("zeropoint.control_plane")
+
+
+@dataclass
+class SubsystemStatus:
+    name: str
+    healthy: bool
+    details: dict = field(default_factory=dict)
+    checked_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "healthy": self.healthy,
+            "details": self.details,
+            "checked_at": self.checked_at.isoformat(),
+        }
+
+
+class ZeroPointControlPlane:
+    """
+    Unified Control Plane for the ZeroPoint stack.
+
+    Coordinates:
+      - MCP server lifecycle
+      - Ray cluster health
+      - CamNet device fleet
+      - IT support agent
+      - OSINT pipeline
+      - Pentest runner
+      - AI orchestrator
+
+    Usage:
+        cp = ZeroPointControlPlane.from_config("config/mcp_server_config.yaml")
+        await cp.startup()
+        status = await cp.health_check()
+        await cp.shutdown()
+    """
+
+    def __init__(self, config: dict[str, Any]):
+        self.config = config
+        self._subsystems: dict[str, Any] = {}
+        self._status: dict[str, SubsystemStatus] = {}
+        self._started_at: datetime | None = None
+
+    @classmethod
+    def from_config(cls, config_path: str | Path) -> "ZeroPointControlPlane":
+        cfg = yaml.safe_load(Path(config_path).read_text())
+        return cls(cfg)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def startup(self) -> None:
+        logger.info("ZeroPoint Control Plane starting up...")
+        self._started_at = datetime.now(timezone.utc)
+
+        await asyncio.gather(
+            self._init_ray(),
+            self._init_mcp_registry(),
+            self._init_it_support(),
+            self._init_camnet(),
+            self._init_osint(),
+            self._init_ai_orchestrator(),
+            return_exceptions=True,
+        )
+
+        healthy = sum(1 for s in self._status.values() if s.healthy)
+        total = len(self._status)
+        logger.info("Control Plane started: %d/%d subsystems healthy.", healthy, total)
+
+    async def shutdown(self) -> None:
+        logger.info("ZeroPoint Control Plane shutting down...")
+        tasks = []
+        for name, subsystem in self._subsystems.items():
+            shutdown_fn = getattr(subsystem, "shutdown", None)
+            if shutdown_fn:
+                tasks.append(self._safe_shutdown(name, shutdown_fn))
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("Control Plane shutdown complete.")
+
+    @staticmethod
+    async def _safe_shutdown(name: str, fn) -> None:
+        try:
+            await fn()
+        except Exception as exc:
+            logger.warning("Error shutting down %s: %s", name, exc)
+
+    # ------------------------------------------------------------------
+    # Subsystem initializers
+    # ------------------------------------------------------------------
+
+    async def _init_ray(self) -> None:
+        try:
+            import ray
+            ray_cfg = self.config.get("ray", {})
+            address = ray_cfg.get("head_node", "auto")
+            if not ray.is_initialized():
+                ray.init(
+                    address=address,
+                    namespace=ray_cfg.get("namespace", "zeropoint"),
+                    ignore_reinit_error=True,
+                    logging_level=logging.WARNING,
+                )
+            self._subsystems["ray"] = ray
+            self._status["ray"] = SubsystemStatus("ray", True, {
+                "address": address,
+                "nodes": len(ray.nodes()),
+            })
+            logger.info("Ray connected: %s", address)
+        except Exception as exc:
+            self._status["ray"] = SubsystemStatus("ray", False, {"error": str(exc)})
+            logger.warning("Ray unavailable: %s", exc)
+
+    async def _init_mcp_registry(self) -> None:
+        try:
+            from zeropoint.registry import ToolRegistry
+            cfg_path = self.config.get("_config_path", "config/mcp_server_config.yaml")
+            registry = ToolRegistry(cfg_path)
+            registry.load()
+            await registry.startup()
+            self._subsystems["mcp_registry"] = registry
+            self._status["mcp_registry"] = SubsystemStatus(
+                "mcp_registry", True, {"tools": len(registry)}
+            )
+        except Exception as exc:
+            self._status["mcp_registry"] = SubsystemStatus("mcp_registry", False, {"error": str(exc)})
+
+    async def _init_it_support(self) -> None:
+        try:
+            from zeropoint.it_support import ITSupportAgent, DeviceRecoveryWorkflow
+            agent = ITSupportAgent()
+            recovery = DeviceRecoveryWorkflow()
+            self._subsystems["it_support"] = agent
+            self._subsystems["device_recovery"] = recovery
+            self._status["it_support"] = SubsystemStatus("it_support", True)
+        except Exception as exc:
+            self._status["it_support"] = SubsystemStatus("it_support", False, {"error": str(exc)})
+
+    async def _init_camnet(self) -> None:
+        try:
+            from android.camnet_controller import CamNetController
+            cfg_path = self.config.get("_config_path", "config/mcp_server_config.yaml")
+            ctrl = CamNetController.from_config(cfg_path)
+            connected = await ctrl.connect_all()
+            ok_count = sum(1 for v in connected.values() if v)
+            self._subsystems["camnet"] = ctrl
+            self._status["camnet"] = SubsystemStatus(
+                "camnet", ok_count > 0,
+                {"devices_connected": ok_count, "devices_total": len(connected)},
+            )
+        except Exception as exc:
+            self._status["camnet"] = SubsystemStatus("camnet", False, {"error": str(exc)})
+
+    async def _init_osint(self) -> None:
+        try:
+            from zeropoint.osint import OSINTPipeline, InvestigationsAgent
+            inv = InvestigationsAgent(cases_dir="/data/zeropoint/investigations")
+            loaded = inv.load_from_disk()
+            self._subsystems["osint_pipeline"] = OSINTPipeline
+            self._subsystems["investigations"] = inv
+            self._status["osint"] = SubsystemStatus(
+                "osint", True, {"cases_loaded": loaded}
+            )
+        except Exception as exc:
+            self._status["osint"] = SubsystemStatus("osint", False, {"error": str(exc)})
+
+    async def _init_ai_orchestrator(self) -> None:
+        try:
+            from zeropoint.control_plane.ai_orchestrator import AIOrchestrator
+            orch = AIOrchestrator(self.config.get("ray", {}))
+            await orch.startup()
+            self._subsystems["ai_orchestrator"] = orch
+            self._status["ai_orchestrator"] = SubsystemStatus("ai_orchestrator", True)
+        except Exception as exc:
+            self._status["ai_orchestrator"] = SubsystemStatus(
+                "ai_orchestrator", False, {"error": str(exc)}
+            )
+
+    # ------------------------------------------------------------------
+    # Health + status
+    # ------------------------------------------------------------------
+
+    async def health_check(self) -> dict:
+        """Re-check all subsystems and return full health report."""
+        # Refresh Ray node count if available
+        ray = self._subsystems.get("ray")
+        if ray:
+            try:
+                import ray as _ray
+                self._status["ray"].details["nodes"] = len(_ray.nodes())
+                self._status["ray"].healthy = True
+            except Exception:
+                self._status["ray"].healthy = False
+
+        # Refresh CamNet
+        camnet = self._subsystems.get("camnet")
+        if camnet:
+            try:
+                status = await camnet.status()
+                self._status["camnet"].details["active_devices"] = status["active_count"]
+            except Exception:
+                pass
+
+        healthy = [s for s in self._status.values() if s.healthy]
+        return {
+            "overall_healthy": len(healthy) == len(self._status),
+            "healthy_count": len(healthy),
+            "total_subsystems": len(self._status),
+            "uptime_seconds": (
+                (datetime.now(timezone.utc) - self._started_at).total_seconds()
+                if self._started_at else 0
+            ),
+            "subsystems": {k: v.to_dict() for k, v in self._status.items()},
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def get_subsystem(self, name: str) -> Any:
+        return self._subsystems.get(name)
+
+    # ------------------------------------------------------------------
+    # High-level dispatch API
+    # ------------------------------------------------------------------
+
+    async def run_it_ticket(self, title: str, description: str, severity: str = "medium") -> dict:
+        agent = self._subsystems.get("it_support")
+        if not agent:
+            return {"error": "IT Support subsystem not available"}
+        ticket = agent.create_ticket(title, description, severity)
+        diagnosis = await agent.triage(ticket)
+        remediation = await agent.auto_remediate(ticket, diagnosis["issue_type"])
+        return {
+            "ticket": ticket.to_dict(),
+            "diagnosis": diagnosis,
+            "remediation": remediation,
+        }
+
+    async def run_osint(self, target: str, active: bool = False) -> dict:
+        PipelineClass = self._subsystems.get("osint_pipeline")
+        if not PipelineClass:
+            return {"error": "OSINT subsystem not available"}
+        async with PipelineClass() as pipeline:
+            return await pipeline.run_all(target, active=active)
+
+    async def camnet_capture(self, mode: str = "photo") -> dict:
+        camnet = self._subsystems.get("camnet")
+        if not camnet:
+            return {"error": "CamNet not available"}
+        results = await camnet.capture_all(mode=mode)
+        return {"captures": [r.to_dict() for r in results]}
+
+    async def ai_task(self, task_type: str, payload: dict) -> dict:
+        orch = self._subsystems.get("ai_orchestrator")
+        if not orch:
+            return {"error": "AI Orchestrator not available"}
+        return await orch.submit(task_type, payload)
+
+
+========================================================================
+FILE: zeropoint/it_support/__init__.py
+========================================================================
+"""ZeroPoint IT Support automation sub-package."""
+from zeropoint.it_support.it_support_agent import ITSupportAgent
+from zeropoint.it_support.device_recovery import DeviceRecoveryWorkflow
+
+__all__ = ["ITSupportAgent", "DeviceRecoveryWorkflow"]
+
+
+========================================================================
+FILE: zeropoint/it_support/device_recovery.py
+========================================================================
+"""
+ZeroPoint Device Recovery Workflow
+Automated Android device recovery: bootloop, bricked state, factory reset,
+ADB recovery mode, and sideload operations.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger("zeropoint.device_recovery")
+
+
+class DeviceState(str, Enum):
+    UNKNOWN      = "unknown"
+    ONLINE       = "online"
+    OFFLINE      = "offline"
+    BOOTLOOP     = "bootloop"
+    FASTBOOT     = "fastboot"
+    RECOVERY     = "recovery"
+    SIDELOAD     = "sideload"
+    BRICKED      = "bricked"
+
+
+@dataclass
+class RecoveryStep:
+    name: str
+    description: str
+    success: bool = False
+    output: str = ""
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class RecoverySession:
+    session_id: str
+    device_serial: str
+    initial_state: DeviceState
+    target_state: DeviceState
+    steps: list[RecoveryStep] = field(default_factory=list)
+    completed: bool = False
+    success: bool = False
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    finished_at: datetime | None = None
+
+    def add_step(self, name: str, description: str, success: bool, output: str = "") -> RecoveryStep:
+        step = RecoveryStep(name=name, description=description, success=success, output=output)
+        self.steps.append(step)
+        logger.info("[%s] Step '%s': %s", self.session_id, name, "✓" if success else "✗")
+        return step
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "device_serial": self.device_serial,
+            "initial_state": self.initial_state,
+            "target_state": self.target_state,
+            "completed": self.completed,
+            "success": self.success,
+            "started_at": self.started_at.isoformat(),
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+            "steps": [
+                {
+                    "name": s.name,
+                    "description": s.description,
+                    "success": s.success,
+                    "output": s.output[:500],
+                    "timestamp": s.timestamp.isoformat(),
+                }
+                for s in self.steps
+            ],
+        }
+
+
+class DeviceRecoveryWorkflow:
+    """
+    Orchestrates Android device recovery workflows via ADB + fastboot.
+
+    Supported workflows:
+      - soft_reset:       Reboot device normally
+      - recovery_mode:    Boot to recovery, optionally wipe + reformat
+      - fastboot_mode:    Boot to fastboot for image flashing
+      - sideload_ota:     Sideload an OTA zip via ADB sideload
+      - factory_reset:    Wipe data via recovery
+      - adb_reconnect:    Disconnect, kill-server, restart, reconnect
+    """
+
+    def __init__(self):
+        self._sessions: dict[str, RecoverySession] = {}
+        self._counter = 0
+
+    # ------------------------------------------------------------------
+    # ADB / fastboot runners
+    # ------------------------------------------------------------------
+
+    async def _adb(self, args: list[str], serial: str | None = None, timeout: int = 30) -> tuple[str, int]:
+        cmd = ["adb"]
+        if serial:
+            cmd += ["-s", serial]
+        cmd += args
+        return await self._run(cmd, timeout)
+
+    async def _fastboot(self, args: list[str], serial: str | None = None, timeout: int = 60) -> tuple[str, int]:
+        cmd = ["fastboot"]
+        if serial:
+            cmd += ["-s", serial]
+        cmd += args
+        return await self._run(cmd, timeout)
+
+    @staticmethod
+    async def _run(cmd: list[str], timeout: int) -> tuple[str, int]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return out.decode(errors="replace").strip(), proc.returncode or 0
+        except asyncio.TimeoutError:
+            return f"Command timed out after {timeout}s: {' '.join(cmd)}", -1
+        except Exception as exc:
+            return str(exc), -1
+
+    # ------------------------------------------------------------------
+    # Device state detection
+    # ------------------------------------------------------------------
+
+    async def detect_state(self, serial: str) -> DeviceState:
+        # Check ADB
+        out, rc = await self._adb(["get-state"], serial=serial, timeout=5)
+        if rc == 0:
+            state_map = {"device": DeviceState.ONLINE, "recovery": DeviceState.RECOVERY,
+                         "sideload": DeviceState.SIDELOAD, "bootloader": DeviceState.FASTBOOT}
+            return state_map.get(out.strip(), DeviceState.UNKNOWN)
+
+        # Check fastboot
+        out, rc = await self._fastboot(["devices"], timeout=5)
+        if serial in out:
+            return DeviceState.FASTBOOT
+
+        return DeviceState.OFFLINE
+
+    # ------------------------------------------------------------------
+    # Session factory
+    # ------------------------------------------------------------------
+
+    def _new_session(self, serial: str, initial: DeviceState, target: DeviceState) -> RecoverySession:
+        self._counter += 1
+        sid = f"REC-{self._counter:04d}"
+        session = RecoverySession(sid, serial, initial, target)
+        self._sessions[sid] = session
+        return session
+
+    # ------------------------------------------------------------------
+    # Workflows
+    # ------------------------------------------------------------------
+
+    async def soft_reset(self, serial: str) -> RecoverySession:
+        state = await self.detect_state(serial)
+        session = self._new_session(serial, state, DeviceState.ONLINE)
+
+        out, rc = await self._adb(["reboot"], serial=serial)
+        session.add_step("reboot", "Soft reboot via ADB", rc == 0, out)
+
+        await asyncio.sleep(5)
+        for _ in range(12):  # wait up to 60s
+            new_state = await self.detect_state(serial)
+            if new_state == DeviceState.ONLINE:
+                break
+            await asyncio.sleep(5)
+
+        session.success = (await self.detect_state(serial)) == DeviceState.ONLINE
+        session.completed = True
+        session.finished_at = datetime.now(timezone.utc)
+        return session
+
+    async def reboot_to_recovery(self, serial: str) -> RecoverySession:
+        state = await self.detect_state(serial)
+        session = self._new_session(serial, state, DeviceState.RECOVERY)
+
+        out, rc = await self._adb(["reboot", "recovery"], serial=serial)
+        session.add_step("reboot_recovery", "Rebooting to recovery mode", rc == 0, out)
+
+        await asyncio.sleep(8)
+        new_state = await self.detect_state(serial)
+        session.add_step(
+            "verify_recovery", "Verifying recovery mode",
+            new_state == DeviceState.RECOVERY,
+            f"State: {new_state}",
+        )
+        session.success = new_state == DeviceState.RECOVERY
+        session.completed = True
+        session.finished_at = datetime.now(timezone.utc)
+        return session
+
+    async def reboot_to_fastboot(self, serial: str) -> RecoverySession:
+        state = await self.detect_state(serial)
+        session = self._new_session(serial, state, DeviceState.FASTBOOT)
+
+        if state == DeviceState.ONLINE:
+            out, rc = await self._adb(["reboot", "bootloader"], serial=serial)
+            session.add_step("reboot_bootloader", "Rebooting to bootloader via ADB", rc == 0, out)
+        else:
+            # Try fastboot reboot-bootloader
+            out, rc = await self._fastboot(["reboot-bootloader"], serial=serial)
+            session.add_step("fastboot_reboot", "Fastboot reboot to bootloader", rc == 0, out)
+
+        await asyncio.sleep(6)
+        new_state = await self.detect_state(serial)
+        session.success = new_state == DeviceState.FASTBOOT
+        session.completed = True
+        session.finished_at = datetime.now(timezone.utc)
+        return session
+
+    async def sideload_ota(self, serial: str, ota_zip_path: str) -> RecoverySession:
+        state = await self.detect_state(serial)
+        session = self._new_session(serial, state, DeviceState.ONLINE)
+
+        if not Path(ota_zip_path).exists():
+            session.add_step("check_ota", "Verify OTA zip exists", False, f"Not found: {ota_zip_path}")
+            session.completed = True
+            return session
+
+        # Get to sideload mode
+        if state != DeviceState.SIDELOAD:
+            out, rc = await self._adb(["reboot", "sideload"], serial=serial)
+            session.add_step("enter_sideload", "Entering ADB sideload mode", rc == 0, out)
+            await asyncio.sleep(8)
+
+        out, rc = await self._adb(["sideload", ota_zip_path], serial=serial, timeout=300)
+        session.add_step("sideload_ota", f"Sideloading {Path(ota_zip_path).name}", rc == 0, out)
+
+        await asyncio.sleep(5)
+        out, rc = await self._adb(["reboot"], serial=serial)
+        session.add_step("reboot_after_ota", "Rebooting after OTA", rc == 0, out)
+
+        session.success = rc == 0
+        session.completed = True
+        session.finished_at = datetime.now(timezone.utc)
+        return session
+
+    async def factory_reset(self, serial: str, confirmed: bool = False) -> RecoverySession:
+        """⚠ DESTRUCTIVE — wipes all user data. confirmed=True required."""
+        state = await self.detect_state(serial)
+        session = self._new_session(serial, state, DeviceState.ONLINE)
+
+        if not confirmed:
+            session.add_step(
+                "safety_gate", "Factory reset requires confirmed=True",
+                False, "Aborted — confirmation not given."
+            )
+            session.completed = True
+            return session
+
+        # Boot to recovery first
+        if state != DeviceState.RECOVERY:
+            out, rc = await self._adb(["reboot", "recovery"], serial=serial)
+            session.add_step("reboot_recovery", "Boot to recovery", rc == 0, out)
+            await asyncio.sleep(10)
+
+        # Issue wipe commands via ADB in recovery
+        for cmd_args, label in [
+            (["shell", "recovery", "--wipe_data"], "Wipe data partition"),
+            (["shell", "recovery", "--wipe_cache"], "Wipe cache partition"),
+        ]:
+            out, rc = await self._adb(cmd_args, serial=serial, timeout=120)
+            session.add_step(label.lower().replace(" ", "_"), label, rc == 0, out)
+
+        out, rc = await self._adb(["reboot"], serial=serial)
+        session.add_step("reboot_final", "Final reboot after wipe", rc == 0, out)
+
+        session.success = rc == 0
+        session.completed = True
+        session.finished_at = datetime.now(timezone.utc)
+        return session
+
+    async def adb_reconnect(self, serial: str) -> RecoverySession:
+        """Full ADB reconnect: disconnect, kill-server, start-server, connect."""
+        state = await self.detect_state(serial)
+        session = self._new_session(serial, state, DeviceState.ONLINE)
+
+        steps = [
+            (["disconnect", serial], "Disconnect device"),
+            (["kill-server"],        "Kill ADB server"),
+            (["start-server"],       "Start ADB server"),
+            (["connect", serial],    "Reconnect device"),
+        ]
+        for args, label in steps:
+            out, rc = await self._adb(args, timeout=15)
+            session.add_step(label.lower().replace(" ", "_"), label, rc == 0, out)
+            await asyncio.sleep(1)
+
+        await asyncio.sleep(3)
+        final_state = await self.detect_state(serial)
+        session.success = final_state == DeviceState.ONLINE
+        session.completed = True
+        session.finished_at = datetime.now(timezone.utc)
+        return session
+
+    # ------------------------------------------------------------------
+    # History
+    # ------------------------------------------------------------------
+
+    def get_session(self, session_id: str) -> dict | None:
+        s = self._sessions.get(session_id)
+        return s.to_dict() if s else None
+
+    def list_sessions(self) -> list[dict]:
+        return [s.to_dict() for s in sorted(self._sessions.values(), key=lambda s: s.started_at, reverse=True)]
+
+
+========================================================================
+FILE: zeropoint/it_support/it_support_agent.py
+========================================================================
+"""
+ZeroPoint IT Support Agent
+Automated triage, diagnosis, and remediation for common IT issues.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import subprocess
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any
+
+logger = logging.getLogger("zeropoint.it_support")
+
+
+class Severity(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class TicketStatus(str, Enum):
+    OPEN = "open"
+    TRIAGING = "triaging"
+    IN_PROGRESS = "in_progress"
+    RESOLVED = "resolved"
+    ESCALATED = "escalated"
+
+
+@dataclass
+class Ticket:
+    ticket_id: str
+    title: str
+    description: str
+    severity: Severity = Severity.MEDIUM
+    status: TicketStatus = TicketStatus.OPEN
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    resolved_at: datetime | None = None
+    steps_taken: list[str] = field(default_factory=list)
+    resolution: str = ""
+    device_id: str = ""
+    assigned_to: str = "zeropoint-auto"
+
+    def to_dict(self) -> dict:
+        return {
+            "ticket_id": self.ticket_id,
+            "title": self.title,
+            "description": self.description,
+            "severity": self.severity,
+            "status": self.status,
+            "created_at": self.created_at.isoformat(),
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "steps_taken": self.steps_taken,
+            "resolution": self.resolution,
+            "device_id": self.device_id,
+            "assigned_to": self.assigned_to,
+        }
+
+
+class ITSupportAgent:
+    """
+    Automated IT support agent for ZeroPoint infrastructure.
+
+    Handles: connectivity issues, disk space alerts, service restarts,
+    log analysis, user account issues, and device health checks.
+    """
+
+    KNOWN_ISSUES = {
+        "no_network": ["ping", "dns", "gateway", "network", "connectivity", "offline"],
+        "disk_full":  ["disk", "space", "full", "storage", "no space left"],
+        "service_down": ["service", "daemon", "crash", "stopped", "failed", "dead"],
+        "high_cpu": ["cpu", "load", "slow", "hung", "freeze", "100%"],
+        "high_memory": ["memory", "ram", "oom", "out of memory", "swap"],
+        "auth_failure": ["login", "auth", "password", "permission denied", "sudo"],
+        "device_offline": ["device", "offline", "adb", "disconnected", "not found"],
+    }
+
+    def __init__(self):
+        self._tickets: dict[str, Ticket] = {}
+        self._counter = 0
+
+    # ------------------------------------------------------------------
+    # Ticket Management
+    # ------------------------------------------------------------------
+
+    def create_ticket(
+        self,
+        title: str,
+        description: str,
+        severity: str = "medium",
+        device_id: str = "",
+    ) -> Ticket:
+        self._counter += 1
+        tid = f"ZIT-{self._counter:04d}"
+        ticket = Ticket(
+            ticket_id=tid,
+            title=title,
+            description=description,
+            severity=Severity(severity),
+            device_id=device_id,
+        )
+        self._tickets[tid] = ticket
+        logger.info("Created ticket %s: %s", tid, title)
+        return ticket
+
+    def get_ticket(self, ticket_id: str) -> Ticket | None:
+        return self._tickets.get(ticket_id)
+
+    def list_tickets(self, status: str | None = None) -> list[dict]:
+        tickets = self._tickets.values()
+        if status:
+            tickets = [t for t in tickets if t.status == status]
+        return [t.to_dict() for t in sorted(tickets, key=lambda t: t.created_at, reverse=True)]
+
+    # ------------------------------------------------------------------
+    # Triage
+    # ------------------------------------------------------------------
+
+    def classify_issue(self, description: str) -> str:
+        """Classify issue type from description keywords."""
+        desc_lower = description.lower()
+        for issue_type, keywords in self.KNOWN_ISSUES.items():
+            if any(kw in desc_lower for kw in keywords):
+                return issue_type
+        return "unknown"
+
+    async def triage(self, ticket: Ticket) -> dict:
+        """Run automated triage and return diagnosis."""
+        ticket.status = TicketStatus.TRIAGING
+        issue_type = self.classify_issue(ticket.description)
+        ticket.steps_taken.append(f"Classified as: {issue_type}")
+        diagnosis = await self._diagnose(issue_type, ticket.device_id)
+        return {"issue_type": issue_type, "diagnosis": diagnosis}
+
+    async def _diagnose(self, issue_type: str, device_id: str) -> dict:
+        handlers = {
+            "no_network":   self._diag_network,
+            "disk_full":    self._diag_disk,
+            "service_down": self._diag_services,
+            "high_cpu":     self._diag_cpu,
+            "high_memory":  self._diag_memory,
+            "auth_failure": self._diag_auth,
+            "device_offline": self._diag_device,
+        }
+        handler = handlers.get(issue_type, self._diag_generic)
+        return await handler(device_id)
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    async def _run(self, cmd: list[str], timeout: int = 10) -> tuple[str, int]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return out.decode(errors="replace").strip(), proc.returncode or 0
+        except Exception as exc:
+            return str(exc), -1
+
+    async def _diag_network(self, _: str) -> dict:
+        results = {}
+        out, rc = await self._run(["ping", "-c", "3", "-W", "2", "8.8.8.8"])
+        results["internet_ping"] = {"output": out, "reachable": rc == 0}
+        out, rc = await self._run(["ip", "route", "show"])
+        results["routing_table"] = out
+        out, rc = await self._run(["cat", "/etc/resolv.conf"])
+        results["dns_config"] = out
+        return results
+
+    async def _diag_disk(self, _: str) -> dict:
+        out, _ = await self._run(["df", "-h"])
+        du_out, _ = await self._run(["du", "-sh", "/var/log", "/tmp", "/data"])
+        return {"disk_usage": out, "large_dirs": du_out}
+
+    async def _diag_services(self, _: str) -> dict:
+        out, _ = await self._run(["systemctl", "list-units", "--state=failed", "--no-pager"])
+        return {"failed_services": out}
+
+    async def _diag_cpu(self, _: str) -> dict:
+        out, _ = await self._run(["ps", "aux", "--sort=-%cpu"])
+        top_out, _ = await self._run(["uptime"])
+        return {"top_processes": "\n".join(out.splitlines()[:20]), "load_average": top_out}
+
+    async def _diag_memory(self, _: str) -> dict:
+        out, _ = await self._run(["free", "-h"])
+        ps_out, _ = await self._run(["ps", "aux", "--sort=-%mem"])
+        return {"memory_usage": out, "top_processes": "\n".join(ps_out.splitlines()[:10])}
+
+    async def _diag_auth(self, _: str) -> dict:
+        out, _ = await self._run(["tail", "-n", "50", "/var/log/auth.log"])
+        return {"auth_log_tail": out}
+
+    async def _diag_device(self, device_id: str) -> dict:
+        out, rc = await self._run(["adb", "devices", "-l"])
+        return {"adb_devices": out, "target_device": device_id}
+
+    async def _diag_generic(self, _: str) -> dict:
+        out, _ = await self._run(["uptime"])
+        mem, _ = await self._run(["free", "-h"])
+        df, _  = await self._run(["df", "-h", "/"])
+        return {"uptime": out, "memory": mem, "disk_root": df}
+
+    # ------------------------------------------------------------------
+    # Remediation
+    # ------------------------------------------------------------------
+
+    async def auto_remediate(self, ticket: Ticket, issue_type: str) -> dict:
+        """Attempt automatic remediation. Returns action taken."""
+        ticket.status = TicketStatus.IN_PROGRESS
+        actions = []
+
+        if issue_type == "disk_full":
+            out, rc = await self._run(["journalctl", "--vacuum-size=500M"])
+            actions.append(f"Vacuumed journal logs: {out[:200]}")
+            out, rc = await self._run(["find", "/tmp", "-mtime", "+7", "-delete"])
+            actions.append("Deleted /tmp files older than 7 days.")
+
+        elif issue_type == "service_down":
+            # Restart failed systemd services
+            svc_out, _ = await self._run(
+                ["systemctl", "list-units", "--state=failed", "--no-pager", "--plain"]
+            )
+            for line in svc_out.splitlines():
+                parts = line.split()
+                if parts and parts[0].endswith(".service"):
+                    svc = parts[0]
+                    out, rc = await self._run(["systemctl", "restart", svc])
+                    actions.append(f"Restarted {svc}: {'ok' if rc == 0 else 'failed'}")
+
+        elif issue_type == "high_memory":
+            out, rc = await self._run(["sync"])
+            out2, _ = await self._run(
+                ["bash", "-c", "echo 3 > /proc/sys/vm/drop_caches"]
+            )
+            actions.append("Synced and dropped caches.")
+
+        if not actions:
+            actions.append(f"No automatic remediation available for '{issue_type}' — escalating.")
+            ticket.status = TicketStatus.ESCALATED
+        else:
+            ticket.status = TicketStatus.RESOLVED
+            ticket.resolved_at = datetime.now(timezone.utc)
+            ticket.resolution = "; ".join(actions)
+
+        ticket.steps_taken.extend(actions)
+        return {"actions": actions, "status": ticket.status}
+
+
+========================================================================
+FILE: zeropoint/observability.py
+========================================================================
+"""
+ZeroPoint Observability — Prometheus metrics + OpenTelemetry tracing.
+Call init_observability() once at server startup.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Any
+
+logger = logging.getLogger("zeropoint.observability")
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics (optional — graceful fallback if not installed)
+# ---------------------------------------------------------------------------
+try:
+    from prometheus_client import Counter, Histogram, Gauge, start_http_server
+    _PROM_AVAILABLE = True
+except ImportError:
+    _PROM_AVAILABLE = False
+
+_tool_calls_total: Any = None
+_tool_errors_total: Any = None
+_tool_latency: Any = None
+_active_connections: Any = None
+
+
+def _init_prometheus(port: int, path: str) -> None:
+    global _tool_calls_total, _tool_errors_total, _tool_latency, _active_connections
+    if not _PROM_AVAILABLE:
+        logger.warning("prometheus_client not installed — metrics disabled.")
+        return
+
+    _tool_calls_total = Counter(
+        "zeropoint_tool_calls_total",
+        "Total MCP tool invocations",
+        ["tool_name", "status"],
+    )
+    _tool_errors_total = Counter(
+        "zeropoint_tool_errors_total",
+        "Total MCP tool errors",
+        ["tool_name", "error_code"],
+    )
+    _tool_latency = Histogram(
+        "zeropoint_tool_latency_seconds",
+        "MCP tool execution latency",
+        ["tool_name"],
+        buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+    )
+    _active_connections = Gauge(
+        "zeropoint_active_connections",
+        "Currently active WebSocket connections",
+    )
+
+    start_http_server(port)
+    logger.info("Prometheus metrics serving on :%d%s", port, path)
+
+
+# ---------------------------------------------------------------------------
+# OpenTelemetry tracing (optional)
+# ---------------------------------------------------------------------------
+try:
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    _OTEL_AVAILABLE = True
+except ImportError:
+    _OTEL_AVAILABLE = False
+
+_tracer: Any = None
+
+
+def _init_tracing(endpoint: str) -> None:
+    global _tracer
+    if not _OTEL_AVAILABLE:
+        logger.warning("opentelemetry not installed — tracing disabled.")
+        return
+
+    provider = TracerProvider()
+    exporter = OTLPSpanExporter(endpoint=endpoint, insecure=True)
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+    _tracer = trace.get_tracer("zeropoint.mcp")
+    logger.info("OpenTelemetry tracing → %s", endpoint)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def init_observability(cfg: dict[str, Any]) -> None:
+    """Initialize metrics and tracing from the observability config block."""
+    metrics_cfg = cfg.get("metrics", {})
+    if metrics_cfg.get("enabled", False):
+        _init_prometheus(
+            port=metrics_cfg.get("port", 9090),
+            path=metrics_cfg.get("path", "/metrics"),
+        )
+
+    tracing_cfg = cfg.get("tracing", {})
+    if tracing_cfg.get("enabled", False):
+        _init_tracing(endpoint=tracing_cfg.get("endpoint", "http://localhost:4317"))
+
+
+def record_tool_call(tool_name: str, success: bool, latency_s: float = 0.0) -> None:
+    """Record a completed tool call in Prometheus."""
+    status = "success" if success else "error"
+    if _tool_calls_total is not None:
+        _tool_calls_total.labels(tool_name=tool_name, status=status).inc()
+    if _tool_latency is not None and latency_s > 0:
+        _tool_latency.labels(tool_name=tool_name).observe(latency_s)
+
+
+def record_tool_error(tool_name: str, error_code: str) -> None:
+    if _tool_errors_total is not None:
+        _tool_errors_total.labels(tool_name=tool_name, error_code=error_code).inc()
+
+
+def connection_opened() -> None:
+    if _active_connections is not None:
+        _active_connections.inc()
+
+
+def connection_closed() -> None:
+    if _active_connections is not None:
+        _active_connections.dec()
+
+
+class traced:
+    """Context manager / decorator that wraps a block in an OTEL span."""
+
+    def __init__(self, name: str, attributes: dict | None = None):
+        self.name = name
+        self.attributes = attributes or {}
+        self._span = None
+
+    def __enter__(self):
+        if _tracer:
+            self._span = _tracer.start_span(self.name)
+            for k, v in self.attributes.items():
+                self._span.set_attribute(k, str(v))
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._span:
+            if exc_type:
+                self._span.record_exception(exc_val)
+            self._span.end()
+        return False
+
+
+========================================================================
+FILE: zeropoint/osint/__init__.py
+========================================================================
+"""ZeroPoint OSINT + Investigations sub-package."""
+from zeropoint.osint.pipeline import OSINTPipeline
+from zeropoint.osint.investigations import InvestigationsAgent
+
+__all__ = ["OSINTPipeline", "InvestigationsAgent"]
+
+
+========================================================================
+FILE: zeropoint/osint/investigations.py
+========================================================================
+"""
+ZeroPoint Investigations Agent
+Case management, evidence collection, and link analysis
+for structured OSINT investigations.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger("zeropoint.osint.investigations")
+
+
+class EvidenceType(str, Enum):
+    DOMAIN      = "domain"
+    IP          = "ip"
+    EMAIL       = "email"
+    PERSON      = "person"
+    ORGANIZATION= "organization"
+    PHONE       = "phone"
+    USERNAME    = "username"
+    URL         = "url"
+    HASH        = "hash"
+    FILE        = "file"
+    NOTE        = "note"
+
+
+@dataclass
+class Evidence:
+    evidence_id: str
+    etype: EvidenceType
+    value: str
+    source: str
+    confidence: float          # 0.0 – 1.0
+    tags: list[str] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
+    added_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    linked_to: list[str] = field(default_factory=list)   # other evidence_ids
+
+    def to_dict(self) -> dict:
+        return {
+            "evidence_id": self.evidence_id,
+            "type": self.etype,
+            "value": self.value,
+            "source": self.source,
+            "confidence": round(self.confidence, 2),
+            "tags": self.tags,
+            "metadata": self.metadata,
+            "added_at": self.added_at.isoformat(),
+            "linked_to": self.linked_to,
+        }
+
+
+@dataclass
+class Case:
+    case_id: str
+    title: str
+    description: str
+    status: str = "open"          # open | active | closed | archived
+    priority: str = "medium"      # low | medium | high | critical
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    evidence: dict[str, Evidence] = field(default_factory=dict)
+    timeline: list[dict] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+
+    def add_event(self, actor: str, action: str, detail: str = "") -> None:
+        self.timeline.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "actor": actor,
+            "action": action,
+            "detail": detail,
+        })
+        self.updated_at = datetime.now(timezone.utc)
+
+    def to_dict(self, include_evidence: bool = True) -> dict:
+        d = {
+            "case_id": self.case_id,
+            "title": self.title,
+            "description": self.description,
+            "status": self.status,
+            "priority": self.priority,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "evidence_count": len(self.evidence),
+            "timeline_entries": len(self.timeline),
+            "tags": self.tags,
+            "timeline": self.timeline[-20:],   # last 20 events
+        }
+        if include_evidence:
+            d["evidence"] = {k: v.to_dict() for k, v in self.evidence.items()}
+        return d
+
+
+class InvestigationsAgent:
+    """
+    Manages investigation cases and evidence chains for ZeroPoint.
+
+    Usage:
+        agent = InvestigationsAgent()
+        case = agent.create_case("Suspicious domain activity", "...")
+        ev = agent.add_evidence(case.case_id, EvidenceType.DOMAIN, "evil.example.com", source="user_report")
+        agent.link_evidence(case.case_id, ev.evidence_id, other_id)
+        report = agent.generate_report(case.case_id)
+    """
+
+    def __init__(self, cases_dir: str | None = None):
+        self._cases: dict[str, Case] = {}
+        self._counter = 0
+        self._ev_counter = 0
+        self._cases_dir = Path(cases_dir) if cases_dir else None
+
+    # ------------------------------------------------------------------
+    # Case management
+    # ------------------------------------------------------------------
+
+    def create_case(
+        self,
+        title: str,
+        description: str = "",
+        priority: str = "medium",
+        tags: list[str] | None = None,
+    ) -> Case:
+        self._counter += 1
+        cid = f"ZINV-{self._counter:04d}"
+        case = Case(
+            case_id=cid,
+            title=title,
+            description=description,
+            priority=priority,
+            tags=tags or [],
+        )
+        case.add_event("system", "case_created", title)
+        self._cases[cid] = case
+        logger.info("Created case %s: %s", cid, title)
+        if self._cases_dir:
+            self._persist(case)
+        return case
+
+    def get_case(self, case_id: str) -> Case | None:
+        return self._cases.get(case_id)
+
+    def update_case_status(self, case_id: str, status: str, actor: str = "system") -> bool:
+        case = self._cases.get(case_id)
+        if not case:
+            return False
+        case.status = status
+        case.add_event(actor, "status_changed", status)
+        return True
+
+    def list_cases(self, status: str | None = None) -> list[dict]:
+        cases = self._cases.values()
+        if status:
+            cases = [c for c in cases if c.status == status]
+        return [c.to_dict(include_evidence=False) for c in
+                sorted(cases, key=lambda c: c.updated_at, reverse=True)]
+
+    # ------------------------------------------------------------------
+    # Evidence management
+    # ------------------------------------------------------------------
+
+    def add_evidence(
+        self,
+        case_id: str,
+        etype: EvidenceType,
+        value: str,
+        source: str = "manual",
+        confidence: float = 0.8,
+        tags: list[str] | None = None,
+        metadata: dict | None = None,
+    ) -> Evidence | None:
+        case = self._cases.get(case_id)
+        if not case:
+            logger.warning("Case %s not found", case_id)
+            return None
+
+        self._ev_counter += 1
+        eid = f"EV-{self._ev_counter:05d}"
+        # Fingerprint for deduplication
+        fp = hashlib.sha256(f"{etype}:{value}".encode()).hexdigest()[:12]
+
+        ev = Evidence(
+            evidence_id=f"{eid}-{fp}",
+            etype=etype,
+            value=value,
+            source=source,
+            confidence=confidence,
+            tags=tags or [],
+            metadata=metadata or {},
+        )
+        case.evidence[ev.evidence_id] = ev
+        case.add_event("system", "evidence_added", f"{etype}: {value[:60]}")
+        logger.info("Evidence %s added to %s", ev.evidence_id, case_id)
+        return ev
+
+    def link_evidence(self, case_id: str, ev_id_a: str, ev_id_b: str) -> bool:
+        case = self._cases.get(case_id)
+        if not case:
+            return False
+        ev_a = case.evidence.get(ev_id_a)
+        ev_b = case.evidence.get(ev_id_b)
+        if not ev_a or not ev_b:
+            return False
+        if ev_id_b not in ev_a.linked_to:
+            ev_a.linked_to.append(ev_id_b)
+        if ev_id_a not in ev_b.linked_to:
+            ev_b.linked_to.append(ev_id_a)
+        case.add_event("system", "evidence_linked", f"{ev_id_a} ↔ {ev_id_b}")
+        return True
+
+    def search_evidence(self, case_id: str, query: str) -> list[dict]:
+        case = self._cases.get(case_id)
+        if not case:
+            return []
+        q = query.lower()
+        return [
+            ev.to_dict() for ev in case.evidence.values()
+            if q in ev.value.lower()
+            or q in ev.source.lower()
+            or any(q in t.lower() for t in ev.tags)
+        ]
+
+    # ------------------------------------------------------------------
+    # Link analysis
+    # ------------------------------------------------------------------
+
+    def build_graph(self, case_id: str) -> dict:
+        """Return adjacency graph for evidence link analysis."""
+        case = self._cases.get(case_id)
+        if not case:
+            return {}
+
+        nodes = []
+        edges = []
+        seen_edges: set[frozenset] = set()
+
+        for ev in case.evidence.values():
+            nodes.append({
+                "id": ev.evidence_id,
+                "type": ev.etype,
+                "label": ev.value[:40],
+                "confidence": ev.confidence,
+            })
+            for linked in ev.linked_to:
+                pair = frozenset([ev.evidence_id, linked])
+                if pair not in seen_edges:
+                    seen_edges.add(pair)
+                    edges.append({"source": ev.evidence_id, "target": linked})
+
+        return {
+            "case_id": case_id,
+            "nodes": nodes,
+            "edges": edges,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+        }
+
+    # ------------------------------------------------------------------
+    # Report generation
+    # ------------------------------------------------------------------
+
+    def generate_report(self, case_id: str) -> dict:
+        case = self._cases.get(case_id)
+        if not case:
+            return {"error": f"Case {case_id} not found"}
+
+        # Group evidence by type
+        by_type: dict[str, list] = {}
+        for ev in case.evidence.values():
+            by_type.setdefault(ev.etype, []).append(ev.to_dict())
+
+        # Stats
+        total_links = sum(len(ev.linked_to) for ev in case.evidence.values()) // 2
+        avg_confidence = (
+            sum(ev.confidence for ev in case.evidence.values()) / len(case.evidence)
+            if case.evidence else 0.0
+        )
+
+        report = {
+            "report_generated": datetime.now(timezone.utc).isoformat(),
+            "case": case.to_dict(include_evidence=False),
+            "summary": {
+                "total_evidence": len(case.evidence),
+                "evidence_types": {k: len(v) for k, v in by_type.items()},
+                "total_links": total_links,
+                "avg_confidence": round(avg_confidence, 2),
+                "timeline_entries": len(case.timeline),
+            },
+            "evidence_by_type": by_type,
+            "link_graph": self.build_graph(case_id),
+            "timeline": case.timeline,
+        }
+        return report
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def _persist(self, case: Case) -> None:
+        if not self._cases_dir:
+            return
+        self._cases_dir.mkdir(parents=True, exist_ok=True)
+        path = self._cases_dir / f"{case.case_id}.json"
+        path.write_text(json.dumps(case.to_dict(), indent=2, default=str))
+
+    def load_from_disk(self) -> int:
+        if not self._cases_dir or not self._cases_dir.exists():
+            return 0
+        loaded = 0
+        for path in self._cases_dir.glob("ZINV-*.json"):
+            try:
+                data = json.loads(path.read_text())
+                case = Case(
+                    case_id=data["case_id"],
+                    title=data["title"],
+                    description=data["description"],
+                    status=data.get("status", "open"),
+                    priority=data.get("priority", "medium"),
+                    tags=data.get("tags", []),
+                )
+                for ev_data in data.get("evidence", {}).values():
+                    ev = Evidence(
+                        evidence_id=ev_data["evidence_id"],
+                        etype=EvidenceType(ev_data["type"]),
+                        value=ev_data["value"],
+                        source=ev_data["source"],
+                        confidence=ev_data["confidence"],
+                        tags=ev_data.get("tags", []),
+                        metadata=ev_data.get("metadata", {}),
+                        linked_to=ev_data.get("linked_to", []),
+                    )
+                    case.evidence[ev.evidence_id] = ev
+                self._cases[case.case_id] = case
+                loaded += 1
+            except Exception as exc:
+                logger.warning("Could not load %s: %s", path, exc)
+        return loaded
+
+
+========================================================================
+FILE: zeropoint/osint/pipeline.py
+========================================================================
+"""
+ZeroPoint OSINT Pipeline
+Passive and active intelligence gathering: DNS, WHOIS, IP geo,
+subdomain enumeration, certificate transparency, and social footprint.
+"""
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import json
+import logging
+import socket
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+import aiohttp
+
+logger = logging.getLogger("zeropoint.osint.pipeline")
+
+
+@dataclass
+class OSINTResult:
+    target: str
+    module: str
+    data: dict[str, Any]
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    error: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "target": self.target,
+            "module": self.module,
+            "data": self.data,
+            "timestamp": self.timestamp.isoformat(),
+            "error": self.error,
+        }
+
+
+class OSINTPipeline:
+    """
+    Modular OSINT pipeline. Each gather_* method returns an OSINTResult.
+    run_all() executes all modules concurrently for a target.
+
+    Passive only by default — active probing methods are flagged explicitly.
+    """
+
+    USER_AGENT = "ZeroPoint-OSINT/1.0 (research)"
+
+    def __init__(self, timeout: int = 15):
+        self.timeout = timeout
+        self._session: aiohttp.ClientSession | None = None
+
+    async def __aenter__(self):
+        self._session = aiohttp.ClientSession(
+            headers={"User-Agent": self.USER_AGENT},
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+        )
+        return self
+
+    async def __aexit__(self, *_):
+        if self._session:
+            await self._session.close()
+
+    # ------------------------------------------------------------------
+    # Orchestration
+    # ------------------------------------------------------------------
+
+    async def run_all(self, target: str, active: bool = False) -> dict:
+        """Run all passive (and optionally active) modules against target."""
+        tasks = [
+            self.gather_dns(target),
+            self.gather_whois(target),
+            self.gather_ip_geo(target),
+            self.gather_cert_transparency(target),
+            self.gather_http_headers(target),
+        ]
+        if active:
+            tasks += [
+                self.gather_subdomains(target),
+                self.gather_port_scan(target, ports=[21, 22, 23, 25, 53, 80, 443, 3306, 5432, 8080, 8443]),
+            ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        output = []
+        for r in results:
+            if isinstance(r, OSINTResult):
+                output.append(r.to_dict())
+            elif isinstance(r, Exception):
+                output.append({"error": str(r)})
+
+        return {
+            "target": target,
+            "active_mode": active,
+            "module_count": len(output),
+            "results": output,
+            "run_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # ------------------------------------------------------------------
+    # DNS
+    # ------------------------------------------------------------------
+
+    async def gather_dns(self, target: str) -> OSINTResult:
+        module = "dns"
+        try:
+            loop = asyncio.get_event_loop()
+            records: dict[str, Any] = {}
+
+            for rtype in ("A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA"):
+                try:
+                    import dns.resolver  # type: ignore
+                    answers = await loop.run_in_executor(
+                        None, lambda r=rtype: dns.resolver.resolve(target, r, raise_on_no_answer=False)
+                    )
+                    records[rtype] = [str(a) for a in answers]
+                except Exception:
+                    records[rtype] = []
+
+            return OSINTResult(target, module, {"records": records})
+        except ImportError:
+            # Fallback: socket-based A record only
+            try:
+                loop = asyncio.get_event_loop()
+                addrs = await loop.run_in_executor(None, socket.gethostbyname_ex, target)
+                return OSINTResult(target, module, {"A": addrs[2], "note": "dnspython not installed"})
+            except Exception as exc:
+                return OSINTResult(target, module, {}, error=str(exc))
+        except Exception as exc:
+            return OSINTResult(target, module, {}, error=str(exc))
+
+    # ------------------------------------------------------------------
+    # WHOIS
+    # ------------------------------------------------------------------
+
+    async def gather_whois(self, target: str) -> OSINTResult:
+        module = "whois"
+        try:
+            import whois as pywhois  # type: ignore
+            loop = asyncio.get_event_loop()
+            w = await loop.run_in_executor(None, pywhois.whois, target)
+            data = {k: str(v) for k, v in (w or {}).items() if v}
+            return OSINTResult(target, module, data)
+        except ImportError:
+            return OSINTResult(target, module, {}, error="whois package not installed")
+        except Exception as exc:
+            return OSINTResult(target, module, {}, error=str(exc))
+
+    # ------------------------------------------------------------------
+    # IP Geolocation (ip-api.com — free, no key)
+    # ------------------------------------------------------------------
+
+    async def gather_ip_geo(self, target: str) -> OSINTResult:
+        module = "ip_geo"
+        try:
+            # Resolve to IP first
+            loop = asyncio.get_event_loop()
+            ip = await loop.run_in_executor(None, socket.gethostbyname, target)
+
+            # Skip private IPs
+            if ipaddress.ip_address(ip).is_private:
+                return OSINTResult(target, module, {"ip": ip, "note": "Private IP — skipped geo lookup"})
+
+            assert self._session
+            async with self._session.get(f"http://ip-api.com/json/{ip}?fields=66846719") as resp:
+                data = await resp.json()
+            data["resolved_ip"] = ip
+            return OSINTResult(target, module, data)
+        except Exception as exc:
+            return OSINTResult(target, module, {}, error=str(exc))
+
+    # ------------------------------------------------------------------
+    # Certificate Transparency (crt.sh)
+    # ------------------------------------------------------------------
+
+    async def gather_cert_transparency(self, target: str) -> OSINTResult:
+        module = "cert_transparency"
+        try:
+            assert self._session
+            url = f"https://crt.sh/?q={target}&output=json"
+            async with self._session.get(url) as resp:
+                raw = await resp.json(content_type=None)
+
+            domains: set[str] = set()
+            issuers: set[str] = set()
+            for entry in (raw or [])[:200]:
+                name = entry.get("name_value", "")
+                for d in name.splitlines():
+                    d = d.strip().lstrip("*.")
+                    if d:
+                        domains.add(d)
+                issuer = entry.get("issuer_ca_id", "")
+                if issuer:
+                    issuers.add(str(issuer))
+
+            return OSINTResult(target, module, {
+                "subdomains_found": sorted(domains),
+                "cert_count": len(raw or []),
+                "unique_subdomains": len(domains),
+            })
+        except Exception as exc:
+            return OSINTResult(target, module, {}, error=str(exc))
+
+    # ------------------------------------------------------------------
+    # HTTP Headers (passive fingerprinting)
+    # ------------------------------------------------------------------
+
+    async def gather_http_headers(self, target: str) -> OSINTResult:
+        module = "http_headers"
+        results = {}
+        for scheme in ("https", "http"):
+            url = f"{scheme}://{target}"
+            try:
+                assert self._session
+                async with self._session.head(url, allow_redirects=True) as resp:
+                    results[scheme] = {
+                        "status": resp.status,
+                        "final_url": str(resp.url),
+                        "server": resp.headers.get("Server", ""),
+                        "x_powered_by": resp.headers.get("X-Powered-By", ""),
+                        "x_frame_options": resp.headers.get("X-Frame-Options", ""),
+                        "content_security_policy": resp.headers.get("Content-Security-Policy", "")[:200],
+                        "strict_transport_security": resp.headers.get("Strict-Transport-Security", ""),
+                        "set_cookie": "present" if "Set-Cookie" in resp.headers else "absent",
+                    }
+                break
+            except Exception as exc:
+                results[scheme] = {"error": str(exc)}
+
+        return OSINTResult(target, module, results)
+
+    # ------------------------------------------------------------------
+    # Subdomain enumeration (active — wordlist based)
+    # ------------------------------------------------------------------
+
+    async def gather_subdomains(self, target: str, wordlist: list[str] | None = None) -> OSINTResult:
+        module = "subdomains_active"
+        common = wordlist or [
+            "www", "mail", "ftp", "smtp", "api", "dev", "staging", "test",
+            "admin", "vpn", "portal", "app", "cdn", "static", "img",
+            "remote", "citrix", "webmail", "secure", "shop", "blog",
+        ]
+        found = []
+        loop = asyncio.get_event_loop()
+
+        async def _check(sub: str):
+            fqdn = f"{sub}.{target}"
+            try:
+                await loop.run_in_executor(None, socket.gethostbyname, fqdn)
+                found.append(fqdn)
+            except socket.gaierror:
+                pass
+
+        await asyncio.gather(*[_check(s) for s in common])
+        return OSINTResult(target, module, {"found": sorted(found), "tested": len(common)})
+
+    # ------------------------------------------------------------------
+    # Port scan (active)
+    # ------------------------------------------------------------------
+
+    async def gather_port_scan(self, target: str, ports: list[int] | None = None) -> OSINTResult:
+        module = "port_scan_active"
+        ports = ports or [22, 80, 443, 8080, 8443]
+        loop = asyncio.get_event_loop()
+        open_ports = []
+
+        async def _probe(port: int):
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(target, port), timeout=2
+                )
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                open_ports.append(port)
+            except Exception:
+                pass
+
+        await asyncio.gather(*[_probe(p) for p in ports])
+        return OSINTResult(target, module, {
+            "open_ports": sorted(open_ports),
+            "scanned": len(ports),
+            "note": "TCP connect scan only",
+        })
+
+
+========================================================================
+FILE: zeropoint/pentest/__init__.py
+========================================================================
+"""ZeroPoint penetration testing automation sub-package."""
+from zeropoint.pentest.kali_runner import KaliRunner
+from zeropoint.pentest.credential_recovery import CredentialRecovery
+
+__all__ = ["KaliRunner", "CredentialRecovery"]
+
+
+========================================================================
+FILE: zeropoint/pentest/credential_recovery.py
+========================================================================
+"""
+ZeroPoint Credential Recovery Tooling
+Assists with legitimate credential recovery for systems and accounts
+you own or are authorized to recover. NOT for unauthorized access.
+
+Covers: local Linux accounts, Android PINs/patterns via ADB,
+SSH key recovery, config file credential extraction, and
+env-var / secrets auditing.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger("zeropoint.pentest.credential_recovery")
+
+
+@dataclass
+class RecoveryAttempt:
+    method: str
+    target: str
+    success: bool
+    result: dict = field(default_factory=dict)
+    notes: str = ""
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self) -> dict:
+        return {
+            "method": self.method,
+            "target": self.target,
+            "success": self.success,
+            "result": self.result,
+            "notes": self.notes,
+            "timestamp": self.timestamp.isoformat(),
+        }
+
+
+class CredentialRecovery:
+    """
+    Authorized credential recovery for ZeroPoint-managed systems.
+
+    Safety policy:
+      - Every method requires authorized=True.
+      - Results are logged with timestamps for audit trails.
+      - No credentials are stored in memory beyond the call scope.
+      - Intended for account owners and authorized IT admins only.
+    """
+
+    AUDIT_LOG = Path("/var/log/zeropoint-mcp/credential_recovery_audit.log")
+
+    def __init__(self):
+        self.AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _audit(self, method: str, target: str, actor: str = "zeropoint") -> None:
+        entry = (
+            f"{datetime.now(timezone.utc).isoformat()} | "
+            f"method={method} target={target} actor={actor}\n"
+        )
+        try:
+            with open(self.AUDIT_LOG, "a") as f:
+                f.write(entry)
+        except OSError:
+            logger.warning("Could not write audit log.")
+
+    @staticmethod
+    async def _run(cmd: list[str], timeout: int = 30) -> tuple[str, int]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return out.decode(errors="replace").strip(), proc.returncode or 0
+        except asyncio.TimeoutError:
+            return f"Timed out after {timeout}s", -1
+        except Exception as exc:
+            return str(exc), -1
+
+    def _gate(self, authorized: bool, method: str) -> None:
+        if not authorized:
+            raise PermissionError(
+                f"[{method}] Set authorized=True to confirm you own or have "
+                "written permission to recover credentials for this target."
+            )
+
+    # ------------------------------------------------------------------
+    # Linux local account recovery
+    # ------------------------------------------------------------------
+
+    async def reset_linux_password(
+        self,
+        username: str,
+        new_password: str,
+        authorized: bool = False,
+    ) -> RecoveryAttempt:
+        """
+        Reset a local Linux user's password using `chpasswd`.
+        Must run as root. Authorized use only.
+        """
+        self._gate(authorized, "reset_linux_password")
+        self._audit("reset_linux_password", username)
+
+        if os.geteuid() != 0:
+            return RecoveryAttempt(
+                "reset_linux_password", username, False,
+                notes="Must run as root."
+            )
+
+        # Use chpasswd — pipe username:newpass
+        proc = await asyncio.create_subprocess_exec(
+            "chpasswd",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        payload = f"{username}:{new_password}\n".encode()
+        _, stderr_b = await proc.communicate(input=payload)
+        success = (proc.returncode or 0) == 0
+
+        return RecoveryAttempt(
+            "reset_linux_password", username, success,
+            result={"stderr": stderr_b.decode(errors="replace")},
+            notes="Password reset via chpasswd." if success else "chpasswd failed.",
+        )
+
+    async def list_local_users(self, authorized: bool = False) -> RecoveryAttempt:
+        """List local users from /etc/passwd (non-system accounts)."""
+        self._gate(authorized, "list_local_users")
+        self._audit("list_local_users", "/etc/passwd")
+
+        try:
+            passwd = Path("/etc/passwd").read_text()
+            users = []
+            for line in passwd.splitlines():
+                parts = line.split(":")
+                if len(parts) < 7:
+                    continue
+                uid = int(parts[2])
+                if uid >= 1000 and parts[6] not in ("/usr/sbin/nologin", "/bin/false"):
+                    users.append({
+                        "username": parts[0],
+                        "uid": uid,
+                        "gid": parts[3],
+                        "home": parts[5],
+                        "shell": parts[6],
+                    })
+            return RecoveryAttempt(
+                "list_local_users", "/etc/passwd", True,
+                result={"users": users, "count": len(users)},
+            )
+        except Exception as exc:
+            return RecoveryAttempt("list_local_users", "/etc/passwd", False, notes=str(exc))
+
+    # ------------------------------------------------------------------
+    # Android PIN / gesture recovery (ADB — requires USB debugging ON)
+    # ------------------------------------------------------------------
+
+    async def android_remove_lockscreen(
+        self,
+        device_serial: str,
+        authorized: bool = False,
+    ) -> RecoveryAttempt:
+        """
+        Remove Android lockscreen via ADB (requires USB debugging enabled).
+        Works on devices where ADB is already authorized.
+        """
+        self._gate(authorized, "android_remove_lockscreen")
+        self._audit("android_remove_lockscreen", device_serial)
+
+        attempts = []
+
+        # Method 1: Delete gesture/password files (older Android)
+        for db_path in [
+            "/data/system/gesture.key",
+            "/data/system/password.key",
+            "/data/system/locksettings.db",
+        ]:
+            out, rc = await self._run(
+                ["adb", "-s", device_serial, "shell", f"rm -f {db_path}"]
+            )
+            attempts.append({"file": db_path, "result": out, "rc": rc})
+
+        # Method 2: Disable lock via settings (Android 5+, requires root or ADB)
+        out, rc = await self._run([
+            "adb", "-s", device_serial, "shell",
+            "settings put global lockscreen.disabled 1"
+        ])
+        attempts.append({"settings": "lockscreen.disabled=1", "result": out, "rc": rc})
+
+        # Reboot to apply
+        await self._run(["adb", "-s", device_serial, "shell", "reboot"])
+
+        success = any(a.get("rc", 1) == 0 for a in attempts)
+        return RecoveryAttempt(
+            "android_remove_lockscreen", device_serial, success,
+            result={"attempts": attempts},
+            notes="Reboot triggered. Check device after ~45 seconds.",
+        )
+
+    async def android_backup_data(
+        self,
+        device_serial: str,
+        output_path: str,
+        authorized: bool = False,
+    ) -> RecoveryAttempt:
+        """Create ADB backup before wiping device."""
+        self._gate(authorized, "android_backup_data")
+        self._audit("android_backup_data", device_serial)
+
+        out, rc = await self._run([
+            "adb", "-s", device_serial, "backup",
+            "-apk", "-shared", "-all", "-f", output_path,
+        ], timeout=300)
+
+        return RecoveryAttempt(
+            "android_backup_data", device_serial, rc == 0,
+            result={"output_path": output_path, "output": out},
+        )
+
+    # ------------------------------------------------------------------
+    # SSH key generation / recovery
+    # ------------------------------------------------------------------
+
+    async def generate_ssh_keypair(
+        self,
+        key_path: str,
+        key_type: str = "ed25519",
+        comment: str = "zeropoint-recovery",
+        authorized: bool = False,
+    ) -> RecoveryAttempt:
+        """Generate a fresh SSH keypair at the specified path."""
+        self._gate(authorized, "generate_ssh_keypair")
+        self._audit("generate_ssh_keypair", key_path)
+
+        valid_types = {"rsa", "ed25519", "ecdsa"}
+        if key_type not in valid_types:
+            raise ValueError(f"key_type must be one of {valid_types}")
+
+        out, rc = await self._run([
+            "ssh-keygen", "-t", key_type, "-f", key_path,
+            "-C", comment, "-N", "",   # empty passphrase
+        ])
+
+        pub_key = ""
+        pub_path = Path(key_path + ".pub")
+        if pub_path.exists():
+            pub_key = pub_path.read_text().strip()
+
+        return RecoveryAttempt(
+            "generate_ssh_keypair", key_path, rc == 0,
+            result={"public_key": pub_key, "private_key_path": key_path},
+            notes=out,
+        )
+
+    async def find_ssh_keys(
+        self,
+        search_dir: str = "/root",
+        authorized: bool = False,
+    ) -> RecoveryAttempt:
+        """Locate existing SSH private keys under a directory."""
+        self._gate(authorized, "find_ssh_keys")
+        self._audit("find_ssh_keys", search_dir)
+
+        out, rc = await self._run([
+            "find", search_dir, "-name", "id_*",
+            "-not", "-name", "*.pub",
+            "-type", "f", "2>/dev/null",
+        ])
+        keys = [k.strip() for k in out.splitlines() if k.strip()]
+        return RecoveryAttempt(
+            "find_ssh_keys", search_dir, True,
+            result={"keys_found": keys, "count": len(keys)},
+        )
+
+    # ------------------------------------------------------------------
+    # Environment / config credential audit
+    # ------------------------------------------------------------------
+
+    async def audit_env_secrets(
+        self,
+        authorized: bool = False,
+    ) -> RecoveryAttempt:
+        """
+        Scan current environment variables for secrets/credentials.
+        Returns keys only (not values) for safety.
+        """
+        self._gate(authorized, "audit_env_secrets")
+        self._audit("audit_env_secrets", "os.environ")
+
+        sensitive_patterns = re.compile(
+            r"(password|passwd|secret|token|api[_-]?key|auth|credential|"
+            r"private[_-]?key|access[_-]?key|bearer|jwt|cert)",
+            re.IGNORECASE,
+        )
+        flagged = [k for k in os.environ if sensitive_patterns.search(k)]
+        total = len(os.environ)
+
+        return RecoveryAttempt(
+            "audit_env_secrets", "environment", True,
+            result={
+                "total_env_vars": total,
+                "sensitive_keys_found": flagged,
+                "sensitive_count": len(flagged),
+                "note": "Values not included for security. Check flagged keys manually.",
+            },
+        )
+
+    async def scan_config_files(
+        self,
+        search_dir: str = "/workspace/zeropoint",
+        authorized: bool = False,
+    ) -> RecoveryAttempt:
+        """
+        Scan config files for hardcoded credentials patterns.
+        Returns file paths and line numbers — not actual values.
+        """
+        self._gate(authorized, "scan_config_files")
+        self._audit("scan_config_files", search_dir)
+
+        pattern = re.compile(
+            r"(password|passwd|secret|api[_-]?key|token|credential)\s*[=:]\s*\S+",
+            re.IGNORECASE,
+        )
+        findings = []
+        search_path = Path(search_dir)
+        exts = {".yaml", ".yml", ".json", ".env", ".conf", ".cfg", ".ini", ".toml"}
+
+        for fpath in search_path.rglob("*"):
+            if fpath.suffix not in exts or not fpath.is_file():
+                continue
+            try:
+                for lineno, line in enumerate(fpath.read_text(errors="replace").splitlines(), 1):
+                    if pattern.search(line):
+                        findings.append({
+                            "file": str(fpath),
+                            "line": lineno,
+                            "pattern_matched": True,
+                            "note": "Value redacted for safety",
+                        })
+            except OSError:
+                continue
+
+        return RecoveryAttempt(
+            "scan_config_files", search_dir, True,
+            result={"findings": findings, "count": len(findings)},
+            notes="Run remediation to move found secrets to env vars or a secrets manager.",
+        )
+
+
+========================================================================
+FILE: zeropoint/pentest/kali_runner.py
+========================================================================
+"""
+ZeroPoint Kali Linux Automation Runner
+Orchestrates security testing tools available on Kali Linux:
+nmap, nikto, gobuster, hydra, sqlmap, metasploit RPC, and custom scripts.
+
+⚠  FOR AUTHORIZED TESTING ONLY.
+   Always obtain written permission before running against any target.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import shutil
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger("zeropoint.pentest.kali")
+
+AUTHORIZED_BANNER = (
+    "ZeroPoint PenTest — AUTHORIZED USE ONLY. "
+    "Running against systems you do not have explicit written permission "
+    "to test is illegal and strictly prohibited."
+)
+
+
+@dataclass
+class ScanResult:
+    tool: str
+    target: str
+    args: list[str]
+    stdout: str
+    stderr: str
+    returncode: int
+    started_at: datetime
+    finished_at: datetime
+    parsed: dict = field(default_factory=dict)
+
+    @property
+    def success(self) -> bool:
+        return self.returncode == 0
+
+    @property
+    def duration_seconds(self) -> float:
+        return (self.finished_at - self.started_at).total_seconds()
+
+    def to_dict(self) -> dict:
+        return {
+            "tool": self.tool,
+            "target": self.target,
+            "args": self.args,
+            "success": self.success,
+            "returncode": self.returncode,
+            "duration_seconds": round(self.duration_seconds, 2),
+            "started_at": self.started_at.isoformat(),
+            "finished_at": self.finished_at.isoformat(),
+            "stdout_lines": len(self.stdout.splitlines()),
+            "stdout": self.stdout[:4000],
+            "stderr": self.stderr[:1000],
+            "parsed": self.parsed,
+        }
+
+
+class KaliRunner:
+    """
+    Runs Kali Linux security tools as async subprocesses and
+    returns structured results. All methods require an explicit
+    authorized=True parameter as a safety gate.
+
+    Tools wrapped:
+      - nmap        — port scanning + service/OS detection
+      - nikto       — web server vulnerability scanning
+      - gobuster    — directory/vhost brute-forcing
+      - sqlmap      — SQL injection detection
+      - hydra       — credential brute-force
+      - enum4linux  — SMB/NetBIOS enumeration
+      - whatweb     — web tech fingerprinting
+    """
+
+    OUTPUT_DIR = Path("/data/zeropoint/pentest")
+
+    def __init__(self, output_dir: str | Path | None = None):
+        self.output_dir = Path(output_dir) if output_dir else self.OUTPUT_DIR
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        logger.warning(AUTHORIZED_BANNER)
+
+    # ------------------------------------------------------------------
+    # Internal runner
+    # ------------------------------------------------------------------
+
+    async def _run(
+        self,
+        tool: str,
+        args: list[str],
+        target: str,
+        timeout: int = 300,
+    ) -> ScanResult:
+        binary = shutil.which(tool)
+        if not binary:
+            return ScanResult(
+                tool=tool, target=target, args=args,
+                stdout="", stderr=f"{tool} not found in PATH. Is Kali installed?",
+                returncode=-1,
+                started_at=datetime.now(timezone.utc),
+                finished_at=datetime.now(timezone.utc),
+            )
+
+        cmd = [binary] + args
+        started = datetime.now(timezone.utc)
+        logger.info("Running: %s", " ".join(cmd))
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            stdout_b, stderr_b = b"", f"Timed out after {timeout}s".encode()
+            returncode = -1
+        else:
+            returncode = proc.returncode or 0
+
+        finished = datetime.now(timezone.utc)
+        return ScanResult(
+            tool=tool,
+            target=target,
+            args=args,
+            stdout=stdout_b.decode(errors="replace"),
+            stderr=stderr_b.decode(errors="replace"),
+            returncode=returncode,
+            started_at=started,
+            finished_at=finished,
+        )
+
+    def _save(self, result: ScanResult) -> Path:
+        ts = result.started_at.strftime("%Y%m%d_%H%M%S")
+        fname = f"{result.tool}_{ts}.json"
+        path = self.output_dir / fname
+        path.write_text(json.dumps(result.to_dict(), indent=2))
+        return path
+
+    # ------------------------------------------------------------------
+    # nmap
+    # ------------------------------------------------------------------
+
+    async def nmap(
+        self,
+        target: str,
+        ports: str = "1-65535",
+        flags: str = "-sV -sC -O",
+        authorized: bool = False,
+    ) -> ScanResult:
+        """
+        Run nmap against a target.
+        flags: nmap flag string, e.g. '-sV -sC' for version/script detection
+        """
+        if not authorized:
+            raise PermissionError("Set authorized=True to confirm you have permission to scan this target.")
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        xml_out = str(self.output_dir / f"nmap_{ts}.xml")
+        args = flags.split() + ["-p", ports, "-oX", xml_out, target]
+
+        result = await self._run("nmap", args, target, timeout=600)
+
+        # Parse XML output for structured data
+        if Path(xml_out).exists():
+            result.parsed = _parse_nmap_xml(xml_out)
+
+        self._save(result)
+        return result
+
+    # ------------------------------------------------------------------
+    # nikto
+    # ------------------------------------------------------------------
+
+    async def nikto(
+        self,
+        target: str,
+        port: int = 443,
+        ssl: bool = True,
+        authorized: bool = False,
+    ) -> ScanResult:
+        if not authorized:
+            raise PermissionError("Set authorized=True to confirm you have permission to scan this target.")
+
+        args = ["-h", target, "-p", str(port), "-Format", "json"]
+        if ssl:
+            args.append("-ssl")
+
+        result = await self._run("nikto", args, target, timeout=300)
+        # Try to parse JSON output from nikto
+        try:
+            result.parsed = json.loads(result.stdout)
+        except Exception:
+            result.parsed = {"raw": result.stdout[:2000]}
+
+        self._save(result)
+        return result
+
+    # ------------------------------------------------------------------
+    # gobuster (directory busting)
+    # ------------------------------------------------------------------
+
+    async def gobuster_dir(
+        self,
+        target_url: str,
+        wordlist: str = "/usr/share/wordlists/dirb/common.txt",
+        extensions: str = "php,html,js,txt",
+        threads: int = 20,
+        authorized: bool = False,
+    ) -> ScanResult:
+        if not authorized:
+            raise PermissionError("Set authorized=True to confirm you have permission.")
+
+        args = [
+            "dir",
+            "-u", target_url,
+            "-w", wordlist,
+            "-x", extensions,
+            "-t", str(threads),
+            "--no-error",
+        ]
+        result = await self._run("gobuster", args, target_url, timeout=600)
+        result.parsed = _parse_gobuster(result.stdout)
+        self._save(result)
+        return result
+
+    # ------------------------------------------------------------------
+    # sqlmap (SQL injection)
+    # ------------------------------------------------------------------
+
+    async def sqlmap(
+        self,
+        target_url: str,
+        data: str | None = None,
+        level: int = 2,
+        risk: int = 1,
+        authorized: bool = False,
+    ) -> ScanResult:
+        if not authorized:
+            raise PermissionError("Set authorized=True to confirm you have permission.")
+
+        args = [
+            "-u", target_url,
+            "--level", str(level),
+            "--risk", str(risk),
+            "--batch",
+            "--output-dir", str(self.output_dir / "sqlmap"),
+        ]
+        if data:
+            args += ["--data", data]
+
+        result = await self._run("sqlmap", args, target_url, timeout=600)
+        self._save(result)
+        return result
+
+    # ------------------------------------------------------------------
+    # hydra (credential brute-force)
+    # ------------------------------------------------------------------
+
+    async def hydra(
+        self,
+        target: str,
+        service: str,
+        userlist: str,
+        passlist: str,
+        port: int | None = None,
+        tasks: int = 16,
+        authorized: bool = False,
+    ) -> ScanResult:
+        if not authorized:
+            raise PermissionError("Set authorized=True to confirm you have permission.")
+
+        args = [
+            "-L", userlist,
+            "-P", passlist,
+            "-t", str(tasks),
+            "-o", str(self.output_dir / f"hydra_{target}.txt"),
+        ]
+        if port:
+            args += ["-s", str(port)]
+        args += [target, service]
+
+        result = await self._run("hydra", args, target, timeout=3600)
+        result.parsed = _parse_hydra(result.stdout)
+        self._save(result)
+        return result
+
+    # ------------------------------------------------------------------
+    # enum4linux (SMB enumeration)
+    # ------------------------------------------------------------------
+
+    async def enum4linux(
+        self,
+        target: str,
+        authorized: bool = False,
+    ) -> ScanResult:
+        if not authorized:
+            raise PermissionError("Set authorized=True to confirm you have permission.")
+
+        args = ["-a", target]
+        result = await self._run("enum4linux", args, target, timeout=120)
+        self._save(result)
+        return result
+
+    # ------------------------------------------------------------------
+    # whatweb (web fingerprinting)
+    # ------------------------------------------------------------------
+
+    async def whatweb(
+        self,
+        target_url: str,
+        aggression: int = 1,
+        authorized: bool = False,
+    ) -> ScanResult:
+        if not authorized:
+            raise PermissionError("Set authorized=True to confirm you have permission.")
+
+        args = [
+            target_url,
+            f"--aggression={aggression}",
+            "--log-json=/dev/stdout",
+            "--quiet",
+        ]
+        result = await self._run("whatweb", args, target_url, timeout=60)
+        try:
+            result.parsed = json.loads(result.stdout)
+        except Exception:
+            result.parsed = {"raw": result.stdout[:2000]}
+        self._save(result)
+        return result
+
+    # ------------------------------------------------------------------
+    # Full recon pipeline
+    # ------------------------------------------------------------------
+
+    async def full_recon(self, target: str, target_url: str | None = None, authorized: bool = False) -> dict:
+        """Run nmap + whatweb + gobuster in sequence. Returns combined report."""
+        if not authorized:
+            raise PermissionError("Set authorized=True to confirm you have permission.")
+
+        results = {}
+
+        nmap_r = await self.nmap(target, flags="-sV -sC", authorized=True)
+        results["nmap"] = nmap_r.to_dict()
+
+        if target_url:
+            ww = await self.whatweb(target_url, authorized=True)
+            results["whatweb"] = ww.to_dict()
+
+            gb = await self.gobuster_dir(target_url, threads=10, authorized=True)
+            results["gobuster"] = gb.to_dict()
+
+        return {
+            "target": target,
+            "ran_at": datetime.now(timezone.utc).isoformat(),
+            "output_dir": str(self.output_dir),
+            "results": results,
+        }
+
+
+###############################################################################
+# Parsers
+###############################################################################
+
+def _parse_nmap_xml(xml_path: str) -> dict:
+    try:
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        hosts = []
+        for host in root.findall("host"):
+            addr_el = host.find("address")
+            addr = addr_el.get("addr", "") if addr_el is not None else ""
+            ports_data = []
+            for port in host.findall(".//port"):
+                state_el = port.find("state")
+                service_el = port.find("service")
+                ports_data.append({
+                    "port": port.get("portid"),
+                    "protocol": port.get("protocol"),
+                    "state": state_el.get("state") if state_el is not None else "",
+                    "service": service_el.get("name") if service_el is not None else "",
+                    "version": (service_el.get("version") or "") if service_el is not None else "",
+                })
+            hosts.append({"address": addr, "ports": ports_data})
+        return {"hosts": hosts}
+    except Exception as exc:
+        return {"parse_error": str(exc)}
+
+
+def _parse_gobuster(stdout: str) -> dict:
+    found = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("/") or (line and "Status:" in line):
+            found.append(line)
+    return {"paths_found": found, "count": len(found)}
+
+
+def _parse_hydra(stdout: str) -> dict:
+    creds = []
+    for line in stdout.splitlines():
+        if "[" in line and "login:" in line.lower():
+            creds.append(line.strip())
+    return {"credentials_found": creds, "count": len(creds)}
+
+
+========================================================================
+FILE: zeropoint/ray_actors/__init__.py
+========================================================================
+"""Ray remote actors for distributing MCP tool work across the cluster."""
+
+
+========================================================================
+FILE: zeropoint/registry.py
+========================================================================
+"""
+Tool Registry — loads tool_registration.json, instantiates tool classes,
+and routes incoming MCP tool-call requests to the correct handler.
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from zeropoint.tools.base import BaseTool, ToolError
+
+logger = logging.getLogger(__name__)
+
+
+###############################################################################
+# Registry
+###############################################################################
+
+class ToolRegistry:
+    """
+    Loads all enabled tools from mcp_server_config.yaml and the
+    tool_registration.json manifest, then routes call() requests.
+
+    Usage:
+        registry = ToolRegistry(config_path="config/mcp_server_config.yaml")
+        await registry.startup()
+
+        response = await registry.call("filesystem_read", {"path": "/workspace/zeropoint"})
+
+        await registry.shutdown()
+    """
+
+    def __init__(self, config_path: str | Path):
+        self._cfg_path = Path(config_path)
+        self._cfg: dict[str, Any] = {}
+        self._manifest: list[dict] = []
+
+        # tool_name -> BaseTool instance
+        self._tools: dict[str, BaseTool] = {}
+        # module_name -> config dict (from mcp_server_config.yaml tools section)
+        self._module_cfg: dict[str, dict] = {}
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
+
+    def load(self) -> None:
+        """Parse config + manifest and instantiate all enabled tools."""
+        self._cfg = yaml.safe_load(self._cfg_path.read_text())
+
+        manifest_path = self._cfg_path.parent / "tool_registration.json"
+        if not manifest_path.exists():
+            # Fall back to repo root
+            manifest_path = self._cfg_path.parent.parent / "tool_registration.json"
+        self._manifest = json.loads(manifest_path.read_text()).get("tools", [])
+
+        tools_cfg: dict[str, Any] = self._cfg.get("tools", {})
+        for module_name, module_cfg in tools_cfg.items():
+            if not module_cfg.get("enabled", True):
+                logger.info("Module '%s' is disabled — skipping.", module_name)
+                continue
+            self._module_cfg[module_name] = module_cfg.get("config", {})
+
+        for tool_spec in self._manifest:
+            module_name = tool_spec.get("module", "")
+            if module_name not in self._module_cfg:
+                logger.debug(
+                    "Tool '%s' module '%s' is disabled — skipping.",
+                    tool_spec["name"], module_name,
+                )
+                continue
+            self._register_tool(tool_spec, self._module_cfg[module_name])
+
+        logger.info(
+            "ToolRegistry loaded: %d tools across %d modules.",
+            len(self._tools), len(self._module_cfg),
+        )
+
+    def _register_tool(self, spec: dict, module_config: dict) -> None:
+        """Import the tool class and store an instance."""
+        tool_name = spec["name"]
+        py_module = spec.get("module", "")
+        py_class = spec.get("class", "")
+
+        # Resolve Python module + class from the manifest spec or config block
+        # Config block wins if it has explicit module/class keys.
+        tools_cfg = self._cfg.get("tools", {})
+        cfg_block = tools_cfg.get(py_module, {})
+        full_module = cfg_block.get("module") or f"zeropoint.tools.{py_module}"
+        class_name = cfg_block.get("class") or py_class or _snake_to_camel(py_module) + "Tool"
+
+        try:
+            mod = importlib.import_module(full_module)
+            cls: type[BaseTool] = getattr(mod, class_name)
+        except (ImportError, AttributeError) as exc:
+            logger.error(
+                "Cannot load tool '%s' from %s.%s: %s",
+                tool_name, full_module, class_name, exc,
+            )
+            return
+
+        # One instance per module (shared across all tools in that module).
+        instance_key = f"{full_module}.{class_name}"
+        if instance_key not in self._tool_instances():
+            instance = cls(config=module_config)
+            # Store under instance key so multiple tool names can share it.
+            object.__setattr__(instance, "_instance_key", instance_key)
+        else:
+            instance = self._tool_instances()[instance_key]
+
+        self._tools[tool_name] = instance
+        logger.debug("Registered tool '%s' → %s", tool_name, instance)
+
+    def _tool_instances(self) -> dict[str, BaseTool]:
+        """Reverse map: instance_key -> BaseTool, derived from self._tools."""
+        seen: dict[str, BaseTool] = {}
+        for inst in self._tools.values():
+            key = getattr(inst, "_instance_key", id(inst))
+            seen[key] = inst
+        return seen
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def startup(self) -> None:
+        """Call startup() on each unique tool instance."""
+        seen: set[int] = set()
+        for tool in self._tools.values():
+            if id(tool) not in seen:
+                await tool.startup()
+                seen.add(id(tool))
+        logger.info("All tools started up.")
+
+    async def shutdown(self) -> None:
+        """Call shutdown() on each unique tool instance."""
+        seen: set[int] = set()
+        for tool in self._tools.values():
+            if id(tool) not in seen:
+                await tool.shutdown()
+                seen.add(id(tool))
+        logger.info("All tools shut down.")
+
+    # ------------------------------------------------------------------
+    # Routing
+    # ------------------------------------------------------------------
+
+    async def call(self, tool_name: str, params: dict[str, Any]) -> dict:
+        """
+        Route an MCP tool call to the correct BaseTool instance.
+
+        Returns an MCP-formatted response dict (always — errors included).
+        """
+        tool = self._tools.get(tool_name)
+        if tool is None:
+            return ToolError(
+                f"Unknown tool: '{tool_name}'. "
+                f"Available: {sorted(self._tools.keys())}",
+                code="UNKNOWN_TOOL",
+            ).to_mcp()
+        return await tool.safe_execute(params)
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+
+    def list_tools(self) -> list[dict]:
+        """Return MCP-formatted tool descriptors for all registered tools."""
+        out = []
+        for spec in self._manifest:
+            if spec["name"] in self._tools:
+                out.append({
+                    "name": spec["name"],
+                    "description": spec.get("description", ""),
+                    "inputSchema": spec.get("input_schema", {}),
+                })
+        return out
+
+    def tool_names(self) -> list[str]:
+        return sorted(self._tools.keys())
+
+    def __len__(self) -> int:
+        return len(self._tools)
+
+
+###############################################################################
+# Helpers
+###############################################################################
+
+def _snake_to_camel(s: str) -> str:
+    return "".join(word.capitalize() for word in s.split("_"))
+
+
+========================================================================
+FILE: zeropoint/server.py
+========================================================================
+"""
+ZeroPoint MCP Server — WebSocket entrypoint.
+
+Implements the Model Context Protocol (MCP) 1.0 over WebSocket + JSON-RPC 2.0.
+Handles: initialize, tools/list, tools/call, ping, shutdown.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import signal
+import sys
+from pathlib import Path
+from typing import Any
+
+import click
+import yaml
+from aiohttp import web
+
+from zeropoint.auth import build_auth
+from zeropoint.observability import init_observability, record_tool_call
+from zeropoint.registry import ToolRegistry
+
+logger = logging.getLogger("zeropoint.server")
+
+###############################################################################
+# JSON-RPC helpers
+###############################################################################
+
+def _ok(req_id: Any, result: Any) -> dict:
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+def _err(req_id: Any, code: int, message: str, data: Any = None) -> dict:
+    err: dict = {"code": code, "message": message}
+    if data is not None:
+        err["data"] = data
+    return {"jsonrpc": "2.0", "id": req_id, "error": err}
+
+###############################################################################
+# MCP WebSocket handler
+###############################################################################
+
+class MCPHandler:
+    """Stateful WebSocket session handler — one instance per connection."""
+
+    PROTOCOL_VERSION = "2024-11-05"
+    SERVER_INFO = {"name": "zeropoint-mcp", "version": "1.0.0"}
+
+    def __init__(self, registry: ToolRegistry, auth: Any, server_cfg: dict):
+        self.registry = registry
+        self.auth = auth
+        self.cfg = server_cfg
+        self._initialized = False
+
+    async def handle_ws(self, request: web.Request) -> web.WebSocketResponse:
+        # Auth check before upgrade
+        if self.auth:
+            auth_header = request.headers.get("Authorization")
+            peer = request.remote or "unknown"
+            if not self.auth.validate_header(auth_header, peer):
+                raise web.HTTPUnauthorized(reason="Invalid or missing bearer token")
+
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+        peer = request.remote or "unknown"
+        logger.info("WebSocket connection from %s", peer)
+
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                response = await self._dispatch(msg.data)
+                if response is not None:
+                    await ws.send_str(json.dumps(response))
+            elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
+                break
+
+        logger.info("WebSocket disconnected: %s", peer)
+        return ws
+
+    async def _dispatch(self, raw: str) -> dict | None:
+        """Parse JSON-RPC, route to method handler, return response."""
+        try:
+            req = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return _err(None, -32700, f"Parse error: {exc}")
+
+        req_id = req.get("id")
+        method = req.get("method", "")
+        params = req.get("params", {})
+
+        try:
+            if method == "initialize":
+                return await self._initialize(req_id, params)
+            elif method == "tools/list":
+                return await self._tools_list(req_id)
+            elif method == "tools/call":
+                return await self._tools_call(req_id, params)
+            elif method == "ping":
+                return _ok(req_id, {})
+            elif method == "shutdown":
+                logger.info("Received shutdown request.")
+                return _ok(req_id, {})
+            else:
+                return _err(req_id, -32601, f"Method not found: {method}")
+        except Exception as exc:
+            logger.error("Unhandled error in method '%s': %s", method, exc, exc_info=True)
+            return _err(req_id, -32603, "Internal error", str(exc))
+
+    async def _initialize(self, req_id: Any, params: dict) -> dict:
+        client_info = params.get("clientInfo", {})
+        logger.info(
+            "MCP initialize from client: %s %s",
+            client_info.get("name", "unknown"),
+            client_info.get("version", ""),
+        )
+        self._initialized = True
+        return _ok(req_id, {
+            "protocolVersion": self.PROTOCOL_VERSION,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": self.SERVER_INFO,
+        })
+
+    async def _tools_list(self, req_id: Any) -> dict:
+        if not self._initialized:
+            return _err(req_id, -32002, "Server not initialized")
+        return _ok(req_id, {"tools": self.registry.list_tools()})
+
+    async def _tools_call(self, req_id: Any, params: dict) -> dict:
+        if not self._initialized:
+            return _err(req_id, -32002, "Server not initialized")
+        tool_name = params.get("name", "")
+        tool_params = params.get("arguments", {})
+        result = await self.registry.call(tool_name, tool_params)
+        record_tool_call(tool_name, success=not result.get("isError", False))
+        return _ok(req_id, result)
+
+###############################################################################
+# HTTP health endpoint
+###############################################################################
+
+async def health_handler(request: web.Request) -> web.Response:
+    registry: ToolRegistry = request.app["registry"]
+    return web.json_response({
+        "status": "ok",
+        "tools": len(registry),
+        "server": MCPHandler.SERVER_INFO,
+    })
+
+###############################################################################
+# App factory
+###############################################################################
+
+def build_app(config_path: str) -> web.Application:
+    cfg = yaml.safe_load(Path(config_path).read_text())
+    server_cfg = cfg.get("server", {})
+
+    # Observability
+    init_observability(cfg.get("observability", {}))
+
+    # Auth
+    auth = build_auth(server_cfg.get("auth", {}))
+
+    # Registry
+    registry = ToolRegistry(config_path)
+    registry.load()
+
+    # aiohttp app
+    app = web.Application()
+    app["registry"] = registry
+    app["config"] = cfg
+
+    handler = MCPHandler(registry, auth, server_cfg)
+
+    app.router.add_get("/mcp", handler.handle_ws)
+    app.router.add_get("/health", health_handler)
+
+    async def on_startup(_app: web.Application) -> None:
+        await registry.startup()
+        logger.info("ZeroPoint MCP server ready.")
+
+    async def on_shutdown(_app: web.Application) -> None:
+        await registry.shutdown()
+        logger.info("ZeroPoint MCP server stopped.")
+
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    return app
+
+###############################################################################
+# CLI
+###############################################################################
+
+@click.command()
+@click.option("--config", default="/workspace/zeropoint/config/mcp_server_config.yaml",
+              show_default=True, help="Path to mcp_server_config.yaml")
+@click.option("--host", default=None, help="Override listen host from config")
+@click.option("--port", default=None, type=int, help="Override listen port from config")
+@click.option("--log-level", default="INFO",
+              type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
+              show_default=True)
+def main(config: str, host: str | None, port: int | None, log_level: str) -> None:
+    """ZeroPoint MCP Server — start the WebSocket MCP endpoint."""
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+    )
+
+    cfg = yaml.safe_load(Path(config).read_text())
+    server_cfg = cfg.get("server", {})
+    listen_host = host or server_cfg.get("host", "0.0.0.0")
+    listen_port = port or server_cfg.get("port", 8765)
+
+    app = build_app(config)
+
+    # Graceful shutdown on SIGINT/SIGTERM
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    runner = web.AppRunner(app)
+
+    async def _run() -> None:
+        await runner.setup()
+        site = web.TCPSite(runner, listen_host, listen_port)
+        await site.start()
+        logger.info("Listening on ws://%s:%d/mcp", listen_host, listen_port)
+        logger.info("Health:   http://%s:%d/health", listen_host, listen_port)
+
+        stop = loop.create_future()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set_result, None)
+
+        await stop
+        await runner.cleanup()
+
+    loop.run_until_complete(_run())
+
+
+if __name__ == "__main__":
+    main()
+
+
+========================================================================
+FILE: zeropoint/tools/__init__.py
+========================================================================
+"""ZeroPoint tool implementations."""
+from zeropoint.tools.base import BaseTool, ToolResult, ToolError
+
+__all__ = ["BaseTool", "ToolResult", "ToolError"]
+
+
+========================================================================
+FILE: zeropoint/tools/adb.py
+========================================================================
+"""
+AdbTool — Android Debug Bridge operations over TCP/USB.
+Registered tool names: adb_shell, adb_push, adb_pull, adb_logcat,
+                       adb_screencap, adb_install
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import shutil
+import time
+from pathlib import Path
+from typing import Any
+
+from zeropoint.tools.base import BaseTool, ToolError, ToolResult
+
+
+class AdbTool(BaseTool):
+    name = "adb"
+    module = "adb"
+    description = "ADB shell, push/pull, logcat, screencap, and APK install."
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def _setup(self) -> None:
+        self._adb_bin: str = self.config.get("adb_binary", "adb")
+        self._server_host: str = self.config.get("adb_server_host", "127.0.0.1")
+        self._server_port: int = self.config.get("adb_server_port", 5037)
+        self._conn_timeout: int = self.config.get("connection_timeout_seconds", 10)
+        self._cmd_timeout: int = self.config.get("command_timeout_seconds", 30)
+        self._max_log: int = self.config.get("max_log_lines", 2000)
+        self._perms: dict = self.config.get("permissions", {})
+
+        # Static devices from config
+        discovery = self.config.get("device_discovery", {})
+        self._static_devices: list[str] = discovery.get("static_devices", [])
+
+    async def startup(self) -> None:
+        # Start ADB server if not running
+        await self._run_adb(["start-server"], timeout=15, device=None)
+        self._log.info("ADB server started at %s:%d", self._server_host, self._server_port)
+
+    async def shutdown(self) -> None:
+        pass  # Leave ADB server running between sessions
+
+    # ------------------------------------------------------------------
+    # ADB runner
+    # ------------------------------------------------------------------
+
+    async def _run_adb(
+        self,
+        args: list[str],
+        device: str | None = None,
+        timeout: int | None = None,
+        stdin_data: bytes | None = None,
+    ) -> tuple[str, str, int]:
+        """
+        Run an adb command asynchronously.
+        Returns (stdout, stderr, returncode).
+        """
+        cmd = [self._adb_bin]
+        if device:
+            cmd += ["-s", device]
+        cmd += ["-P", str(self._server_port)]
+        cmd += args
+
+        timeout_s = timeout or self._cmd_timeout
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE if stdin_data else None,
+            )
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(input=stdin_data),
+                timeout=timeout_s,
+            )
+            return (
+                stdout_b.decode("utf-8", errors="replace").strip(),
+                stderr_b.decode("utf-8", errors="replace").strip(),
+                proc.returncode or 0,
+            )
+        except asyncio.TimeoutError:
+            raise ToolError(
+                f"ADB command timed out after {timeout_s}s: {' '.join(args)}",
+                code="ADB_TIMEOUT",
+            )
+        except FileNotFoundError:
+            raise ToolError(
+                f"ADB binary not found at '{self._adb_bin}'. Is it installed?",
+                code="ADB_NOT_FOUND",
+            )
+
+    def _require_perm(self, perm: str) -> None:
+        if not self._perms.get(perm, True):
+            raise ToolError(
+                f"Permission '{perm}' is disabled in config.",
+                code="PERMISSION_DENIED",
+            )
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+
+    async def execute(self, params: dict[str, Any]) -> ToolResult:
+        op = params.pop("_op", "shell")
+        dispatch = {
+            "shell": self._shell,
+            "push": self._push,
+            "pull": self._pull,
+            "logcat": self._logcat,
+            "screencap": self._screencap,
+            "install": self._install,
+        }
+        handler = dispatch.get(op)
+        if handler is None:
+            raise ToolError(f"Unknown ADB operation: '{op}'", code="UNKNOWN_OP")
+        return await handler(params)
+
+    # ------------------------------------------------------------------
+    # adb_shell
+    # ------------------------------------------------------------------
+
+    async def _shell(self, params: dict) -> ToolResult:
+        self.require(params, "command")
+        self._require_perm("shell")
+        device = params.get("device_id")
+        command: str = params["command"]
+        as_root: bool = params.get("as_root", False)
+
+        if as_root:
+            self._require_perm("root")
+            command = f"su -c '{command}'"
+
+        stdout, stderr, rc = await self._run_adb(
+            ["shell", command],
+            device=device,
+            timeout=params.get("timeout_seconds", self._cmd_timeout),
+        )
+        return ToolResult(data={
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": rc,
+            "device_serial": device or "auto",
+        })
+
+    # ------------------------------------------------------------------
+    # adb_push
+    # ------------------------------------------------------------------
+
+    async def _push(self, params: dict) -> ToolResult:
+        self.require(params, "local_path", "remote_path")
+        self._require_perm("push_pull")
+        device = params.get("device_id")
+        local = params["local_path"]
+        remote = params["remote_path"]
+
+        if not Path(local).exists():
+            raise ToolError(f"Local file not found: '{local}'", code="NOT_FOUND")
+
+        stdout, stderr, rc = await self._run_adb(
+            ["push", local, remote], device=device
+        )
+        if rc != 0:
+            raise ToolError(f"ADB push failed: {stderr}", code="ADB_ERROR")
+
+        # Parse bytes from adb output (e.g. "1 file pushed, 0 skipped. 45.1 MB/s (102400 bytes in 0.002s)")
+        bytes_tx = _parse_bytes_transferred(stdout)
+        return ToolResult(data={"bytes_transferred": bytes_tx, "remote_path": remote})
+
+    # ------------------------------------------------------------------
+    # adb_pull
+    # ------------------------------------------------------------------
+
+    async def _pull(self, params: dict) -> ToolResult:
+        self.require(params, "remote_path", "local_path")
+        self._require_perm("push_pull")
+        device = params.get("device_id")
+        remote = params["remote_path"]
+        local = params["local_path"]
+
+        Path(local).parent.mkdir(parents=True, exist_ok=True)
+        stdout, stderr, rc = await self._run_adb(
+            ["pull", remote, local], device=device
+        )
+        if rc != 0:
+            raise ToolError(f"ADB pull failed: {stderr}", code="ADB_ERROR")
+
+        bytes_tx = _parse_bytes_transferred(stdout)
+        return ToolResult(data={"bytes_transferred": bytes_tx, "local_path": local})
+
+    # ------------------------------------------------------------------
+    # adb_logcat
+    # ------------------------------------------------------------------
+
+    async def _logcat(self, params: dict) -> ToolResult:
+        device = params.get("device_id")
+        filt: str = params.get("filter", "*:D")
+        lines: int = min(params.get("lines", 500), self._max_log)
+        timeout: int = params.get("timeout_seconds", 10)
+
+        stdout, stderr, rc = await self._run_adb(
+            ["logcat", "-d", "-t", str(lines), filt],
+            device=device,
+            timeout=timeout + 5,
+        )
+        log_lines = stdout.splitlines()
+        return ToolResult(data={
+            "log": stdout,
+            "line_count": len(log_lines),
+            "device_serial": device or "auto",
+        })
+
+    # ------------------------------------------------------------------
+    # adb_screencap
+    # ------------------------------------------------------------------
+
+    async def _screencap(self, params: dict) -> ToolResult:
+        device = params.get("device_id")
+        ts = int(time.time())
+        save_path: str = params.get(
+            "save_path",
+            f"/tmp/mcp_scratch/screencap_{device or 'device'}_{ts}.png",
+        )
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # Pull raw PNG bytes via exec-out for speed
+        cmd = [self._adb_bin]
+        if device:
+            cmd += ["-s", device]
+        cmd += ["-P", str(self._server_port), "exec-out", "screencap", "-p"]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            raw, err = await asyncio.wait_for(
+                proc.communicate(), timeout=30
+            )
+        except asyncio.TimeoutError:
+            raise ToolError("Screencap timed out.", code="ADB_TIMEOUT")
+
+        if proc.returncode != 0 or not raw:
+            raise ToolError(
+                f"Screencap failed: {err.decode(errors='replace')}",
+                code="ADB_ERROR",
+            )
+
+        Path(save_path).write_bytes(raw)
+
+        # Detect dimensions from PNG header
+        width = height = 0
+        if raw[:4] == b"\x89PNG" and len(raw) >= 24:
+            import struct
+            width = struct.unpack(">I", raw[16:20])[0]
+            height = struct.unpack(">I", raw[20:24])[0]
+
+        return ToolResult(data={
+            "local_path": save_path,
+            "width": width,
+            "height": height,
+            "size_bytes": len(raw),
+        })
+
+    # ------------------------------------------------------------------
+    # adb_install
+    # ------------------------------------------------------------------
+
+    async def _install(self, params: dict) -> ToolResult:
+        self.require(params, "apk_path")
+        self._require_perm("install_apk")
+        device = params.get("device_id")
+        apk = params["apk_path"]
+        grant: bool = params.get("grant_permissions", True)
+        replace: bool = params.get("replace_existing", True)
+
+        if not Path(apk).exists():
+            raise ToolError(f"APK not found: '{apk}'", code="NOT_FOUND")
+
+        args = ["install"]
+        if grant:
+            args.append("-g")
+        if replace:
+            args.append("-r")
+        args.append(apk)
+
+        stdout, stderr, rc = await self._run_adb(args, device=device, timeout=120)
+        success = rc == 0 and "Success" in stdout
+
+        # Extract package name from aapt if available
+        pkg = ""
+        try:
+            aapt = await asyncio.create_subprocess_exec(
+                "aapt", "dump", "badging", apk,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            out, _ = await aapt.communicate()
+            for line in out.decode(errors="replace").splitlines():
+                if line.startswith("package:"):
+                    import re
+                    m = re.search(r"name='([^']+)'", line)
+                    if m:
+                        pkg = m.group(1)
+                    break
+        except Exception:
+            pkg = Path(apk).stem
+
+        return ToolResult(data={
+            "success": success,
+            "package_name": pkg,
+            "output": stdout,
+            "device_serial": device or "auto",
+        })
+
+
+###############################################################################
+# Helpers
+###############################################################################
+
+def _parse_bytes_transferred(adb_output: str) -> int:
+    import re
+    m = re.search(r"\((\d+)\s+bytes", adb_output)
+    return int(m.group(1)) if m else 0
+
+
+========================================================================
+FILE: zeropoint/tools/android/__init__.py
+========================================================================
+"""Android / CamNet tool sub-package."""
+from zeropoint.tools.android.tool import AndroidTool
+
+__all__ = ["AndroidTool"]
+
+
+========================================================================
+FILE: zeropoint/tools/android/tool.py
+========================================================================
+"""
+AndroidTool — high-level Android automation and CamNet orchestration.
+Registered tool names: android_tap, android_swipe, android_input_text,
+                       android_camera_capture, camnet_status, camnet_sync
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any
+
+from zeropoint.tools.base import BaseTool, ToolError, ToolResult
+
+
+class AndroidTool(BaseTool):
+    name = "android"
+    module = "android"
+    description = "Android UI automation and CamNet multi-device orchestration."
+
+    def _setup(self) -> None:
+        self._cfg = self.config
+        self._camnet_cfg = self.config.get("camnet", {})
+        self._screenshot_dir = Path(self.config.get("screenshot_dir", "/data/camnet/screenshots"))
+        self._video_dir = Path(self.config.get("video_dir", "/data/camnet/recordings"))
+        self._controller = None  # lazy-init in startup()
+
+    async def startup(self) -> None:
+        try:
+            from android.camnet_controller import CamNetController
+            import yaml, os
+            cfg_path = os.environ.get(
+                "MCP_CONFIG", "/workspace/zeropoint/config/mcp_server_config.yaml"
+            )
+            if Path(cfg_path).exists():
+                self._controller = CamNetController.from_config(cfg_path)
+                await self._controller.connect_all()
+                self._log.info("CamNet: %d devices registered.", len(self._controller.devices))
+            else:
+                self._log.warning("MCP_CONFIG not found — CamNet running in stub mode.")
+        except ImportError as exc:
+            self._log.warning("CamNetController unavailable (%s) — stub mode.", exc)
+
+    async def shutdown(self) -> None:
+        if self._controller:
+            await self._controller.disconnect_all()
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+
+    async def execute(self, params: dict[str, Any]) -> ToolResult:
+        op = params.pop("_op", "tap")
+        dispatch = {
+            "tap":              self._tap,
+            "swipe":            self._swipe,
+            "input_text":       self._input_text,
+            "camera_capture":   self._camera_capture,
+            "camnet_status":    self._camnet_status,
+            "camnet_sync":      self._camnet_sync,
+        }
+        handler = dispatch.get(op)
+        if handler is None:
+            raise ToolError(f"Unknown android operation: '{op}'", code="UNKNOWN_OP")
+        return await handler(params)
+
+    # ------------------------------------------------------------------
+    # android_tap
+    # ------------------------------------------------------------------
+
+    async def _tap(self, params: dict) -> ToolResult:
+        self._need_controller()
+        device_id = params.get("device_id")
+        result = await self._controller.tap(
+            device_id=device_id,
+            x=params.get("x"),
+            y=params.get("y"),
+            selector=params.get("selector"),
+            wait_seconds=params.get("wait_seconds", 5.0),
+        )
+        return ToolResult(data=result)
+
+    # ------------------------------------------------------------------
+    # android_swipe
+    # ------------------------------------------------------------------
+
+    async def _swipe(self, params: dict) -> ToolResult:
+        self.require(params, "start_x", "start_y", "end_x", "end_y")
+        self._need_controller()
+        result = await self._controller.swipe(
+            device_id=params.get("device_id"),
+            start_x=params["start_x"],
+            start_y=params["start_y"],
+            end_x=params["end_x"],
+            end_y=params["end_y"],
+            duration_ms=params.get("duration_ms", 300),
+        )
+        return ToolResult(data=result)
+
+    # ------------------------------------------------------------------
+    # android_input_text
+    # ------------------------------------------------------------------
+
+    async def _input_text(self, params: dict) -> ToolResult:
+        self.require(params, "text")
+        self._need_controller()
+        result = await self._controller.input_text(
+            device_id=params.get("device_id"),
+            text=params["text"],
+            clear_first=params.get("clear_first", True),
+        )
+        return ToolResult(data=result)
+
+    # ------------------------------------------------------------------
+    # android_camera_capture
+    # ------------------------------------------------------------------
+
+    async def _camera_capture(self, params: dict) -> ToolResult:
+        self._need_controller()
+        mode = params.get("mode", "photo")
+        if mode not in ("photo", "screencap", "burst"):
+            raise ToolError(f"Invalid mode '{mode}'. Use photo, screencap, or burst.", code="BAD_PARAM")
+
+        results = await self._controller.capture_all(
+            device_ids=params.get("device_ids"),
+            mode="screencap" if mode == "screencap" else "photo",
+            synchronized=params.get("synchronized", True),
+        )
+        return ToolResult(data={"captures": [r.to_dict() for r in results]})
+
+    # ------------------------------------------------------------------
+    # camnet_status
+    # ------------------------------------------------------------------
+
+    async def _camnet_status(self, params: dict) -> ToolResult:
+        self._need_controller()
+        result = await self._controller.status(device_ids=params.get("device_ids"))
+        return ToolResult(data=result)
+
+    # ------------------------------------------------------------------
+    # camnet_sync
+    # ------------------------------------------------------------------
+
+    async def _camnet_sync(self, params: dict) -> ToolResult:
+        self._need_controller()
+        result = await self._controller.sync_media(
+            device_ids=params.get("device_ids"),
+            media_type=params.get("media_type", "all"),
+            delete_after_sync=params.get("delete_after_sync", False),
+            destination=params.get("destination"),
+        )
+        return ToolResult(data=result)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _need_controller(self) -> None:
+        if self._controller is None:
+            raise ToolError(
+                "CamNet controller is not available. Check device config and uiautomator2 install.",
+                code="CONTROLLER_UNAVAILABLE",
+            )
+
+
+========================================================================
+FILE: zeropoint/tools/base.py
+========================================================================
+"""
+BaseTool ABC — all ZeroPoint MCP tools inherit from this.
+
+Every concrete tool must implement:
+    - name: str class attribute
+    - description: str class attribute
+    - async execute(params: dict) -> ToolResult
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+###############################################################################
+# Result / Error types
+###############################################################################
+
+@dataclass
+class ToolResult:
+    """Successful tool response payload."""
+    data: dict[str, Any]
+    tool_name: str = ""
+    duration_ms: float = 0.0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_mcp(self) -> dict:
+        """Serialize to MCP content block list."""
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": _json_dumps(self.data),
+                }
+            ],
+            "_meta": {
+                "tool": self.tool_name,
+                "duration_ms": round(self.duration_ms, 2),
+                **self.metadata,
+            },
+        }
+
+
+class ToolError(Exception):
+    """Raised by a tool when execution fails in a known, reportable way."""
+
+    def __init__(self, message: str, code: str = "TOOL_ERROR", data: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.data = data or {}
+
+    def to_mcp(self) -> dict:
+        return {
+            "isError": True,
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"[{self.code}] {self}"
+                }
+            ],
+            "_meta": {"error_data": self.data},
+        }
+
+
+###############################################################################
+# BaseTool
+###############################################################################
+
+class BaseTool(ABC):
+    """
+    Abstract base class for all ZeroPoint MCP tools.
+
+    Subclasses set class-level attributes and implement `execute()`.
+    The server calls `safe_execute()` which adds timing, logging, and
+    error normalization — tools should NOT override `safe_execute()`.
+    """
+
+    # --- Required class attributes (override in subclass) ---
+    name: str = ""
+    description: str = ""
+    module: str = ""
+
+    def __init__(self, config: dict[str, Any]):
+        """
+        Args:
+            config: The tool's config block from mcp_server_config.yaml,
+                    e.g. cfg["tools"]["filesystem"]["config"]
+        """
+        self.config = config
+        self._log = logging.getLogger(f"zeropoint.tools.{self.name}")
+        self._setup()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def _setup(self) -> None:
+        """Override for one-time initialization logic (non-async)."""
+
+    async def startup(self) -> None:
+        """Called once when the server starts. Override for async init."""
+
+    async def shutdown(self) -> None:
+        """Called once when the server shuts down. Override for cleanup."""
+
+    # ------------------------------------------------------------------
+    # Execution (override this in each tool)
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def execute(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Execute the tool with the given validated parameters.
+
+        Raise ToolError for expected failures (bad path, device offline…).
+        Let unexpected exceptions propagate — safe_execute() catches them.
+        """
+
+    # ------------------------------------------------------------------
+    # Safe wrapper — called by the server, not overridden by tools
+    # ------------------------------------------------------------------
+
+    async def safe_execute(self, params: dict[str, Any]) -> dict:
+        """
+        Wrap `execute()` with timing, logging, and error normalization.
+        Always returns a serializable MCP response dict.
+        """
+        t0 = time.perf_counter()
+        self._log.debug("Invoking %s with params=%s", self.name, list(params.keys()))
+        try:
+            result = await self.execute(params)
+            result.tool_name = self.name
+            result.duration_ms = (time.perf_counter() - t0) * 1000
+            self._log.info(
+                "%s completed in %.1f ms", self.name, result.duration_ms
+            )
+            return result.to_mcp()
+        except ToolError as exc:
+            elapsed = (time.perf_counter() - t0) * 1000
+            self._log.warning(
+                "%s raised ToolError in %.1f ms: [%s] %s",
+                self.name, elapsed, exc.code, exc,
+            )
+            return exc.to_mcp()
+        except Exception as exc:
+            elapsed = (time.perf_counter() - t0) * 1000
+            self._log.error(
+                "%s unexpected error in %.1f ms: %s",
+                self.name, elapsed, exc, exc_info=True,
+            )
+            return ToolError(
+                f"Unexpected error in {self.name}: {exc}",
+                code="INTERNAL_ERROR",
+            ).to_mcp()
+
+    # ------------------------------------------------------------------
+    # Param helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def require(params: dict, *keys: str) -> None:
+        """Raise ToolError if any required key is missing."""
+        missing = [k for k in keys if k not in params or params[k] is None]
+        if missing:
+            raise ToolError(
+                f"Missing required parameter(s): {', '.join(missing)}",
+                code="MISSING_PARAMS",
+            )
+
+    @staticmethod
+    def get(params: dict, key: str, default: Any = None) -> Any:
+        return params.get(key, default)
+
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__} name={self.name!r}>"
+
+
+###############################################################################
+# Utility
+###############################################################################
+
+def _json_dumps(obj: Any) -> str:
+    import json
+
+    class _Enc(json.JSONEncoder):
+        def default(self, o: Any):
+            try:
+                return super().default(o)
+            except TypeError:
+                return str(o)
+
+    return json.dumps(obj, indent=2, cls=_Enc)
+
+
+========================================================================
+FILE: zeropoint/tools/filesystem.py
+========================================================================
+"""
+FilesystemTool — sandboxed local filesystem read/write/list operations.
+Registered tool names: filesystem_read, filesystem_write, filesystem_list
+"""
+
+from __future__ import annotations
+
+import base64
+import fnmatch
+import mimetypes
+import os
+from pathlib import Path
+from typing import Any
+
+from zeropoint.tools.base import BaseTool, ToolError, ToolResult
+
+
+class FilesystemTool(BaseTool):
+    name = "filesystem"
+    module = "filesystem"
+    description = "Read, write, and list sandboxed local filesystem paths."
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def _setup(self) -> None:
+        raw_roots: list[str] = self.config.get("allowed_roots", [])
+        self._roots: list[Path] = [Path(r).resolve() for r in raw_roots]
+        self._deny: list[str] = self.config.get("deny_patterns", [])
+        self._max_bytes: int = self.config.get("max_file_size_mb", 256) * 1024 * 1024
+        self._allow_symlinks: bool = self.config.get("allow_symlinks", False)
+
+        if not self._roots:
+            raise RuntimeError("filesystem: allowed_roots must not be empty")
+
+    # ------------------------------------------------------------------
+    # Guard
+    # ------------------------------------------------------------------
+
+    def _check_path(self, path_str: str) -> Path:
+        """Resolve and validate a path against allowed roots and deny list."""
+        p = Path(path_str).resolve()
+
+        in_root = any(
+            str(p).startswith(str(root)) for root in self._roots
+        )
+        if not in_root:
+            raise ToolError(
+                f"Path '{p}' is outside allowed roots: {[str(r) for r in self._roots]}",
+                code="PATH_DENIED",
+            )
+
+        # Symlink check
+        if not self._allow_symlinks and p.is_symlink():
+            raise ToolError(f"Symlinks are not allowed: '{p}'", code="SYMLINK_DENIED")
+
+        # Deny-pattern check
+        rel = str(p)
+        for pat in self._deny:
+            if fnmatch.fnmatch(rel, pat):
+                raise ToolError(
+                    f"Path '{p}' matches deny pattern '{pat}'",
+                    code="PATH_DENIED",
+                )
+        return p
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+
+    async def execute(self, params: dict[str, Any]) -> ToolResult:
+        # Dispatch on the registered tool name embedded by the registry
+        op = params.pop("_op", "read")
+        if op == "write":
+            return await self._write(params)
+        elif op == "list":
+            return await self._list(params)
+        else:
+            return await self._read(params)
+
+    # ------------------------------------------------------------------
+    # filesystem_read
+    # ------------------------------------------------------------------
+
+    async def _read(self, params: dict) -> ToolResult:
+        self.require(params, "path")
+        p = self._check_path(params["path"])
+
+        if not p.exists():
+            raise ToolError(f"Path does not exist: '{p}'", code="NOT_FOUND")
+        if not p.is_file():
+            raise ToolError(f"Path is not a file: '{p}'", code="NOT_A_FILE")
+        if p.stat().st_size > self._max_bytes:
+            raise ToolError(
+                f"File exceeds max size ({self._max_bytes // 1024 // 1024} MB): '{p}'",
+                code="FILE_TOO_LARGE",
+            )
+
+        encoding: str = params.get("encoding", "auto")
+        mime, _ = mimetypes.guess_type(str(p))
+        is_text = (mime or "").startswith("text/") or p.suffix in {
+            ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".md", ".sh",
+            ".cfg", ".ini", ".toml", ".xml", ".html", ".css", ".txt", ".env",
+        }
+
+        if encoding == "base64" or (encoding == "auto" and not is_text):
+            content = base64.b64encode(p.read_bytes()).decode()
+            enc_used = "base64"
+        else:
+            raw = p.read_bytes()
+            text = raw.decode("utf-8", errors="replace")
+            start = params.get("start_line")
+            end = params.get("end_line")
+            lines = text.splitlines(keepends=True)
+            if start or end:
+                s = (start or 1) - 1
+                e = end or len(lines)
+                lines = lines[s:e]
+                text = "".join(lines)
+            content = text
+            enc_used = "utf-8"
+
+        return ToolResult(data={
+            "content": content,
+            "size_bytes": p.stat().st_size,
+            "mime_type": mime or "application/octet-stream",
+            "encoding": enc_used,
+            "line_count": content.count("\n") if enc_used == "utf-8" else None,
+        })
+
+    # ------------------------------------------------------------------
+    # filesystem_write
+    # ------------------------------------------------------------------
+
+    async def _write(self, params: dict) -> ToolResult:
+        self.require(params, "path", "content")
+        p = self._check_path(params["path"])
+        mode: str = params.get("mode", "overwrite")
+        encoding: str = params.get("encoding", "utf-8")
+
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        if mode == "create_new" and p.exists():
+            raise ToolError(
+                f"File already exists (mode=create_new): '{p}'",
+                code="FILE_EXISTS",
+            )
+
+        content_str: str = params["content"]
+        if encoding == "base64":
+            raw = base64.b64decode(content_str)
+        else:
+            raw = content_str.encode("utf-8")
+
+        if mode == "append":
+            with open(p, "ab") as fh:
+                fh.write(raw)
+        else:
+            p.write_bytes(raw)
+
+        return ToolResult(data={"bytes_written": len(raw), "path": str(p)})
+
+    # ------------------------------------------------------------------
+    # filesystem_list
+    # ------------------------------------------------------------------
+
+    async def _list(self, params: dict) -> ToolResult:
+        self.require(params, "path")
+        p = self._check_path(params["path"])
+
+        if not p.exists():
+            raise ToolError(f"Path does not exist: '{p}'", code="NOT_FOUND")
+        if not p.is_dir():
+            raise ToolError(f"Path is not a directory: '{p}'", code="NOT_A_DIR")
+
+        pattern: str = params.get("pattern", "*")
+        recursive: bool = params.get("recursive", False)
+        include_hidden: bool = params.get("include_hidden", False)
+
+        entries = []
+        glob_fn = p.rglob if recursive else p.glob
+        for entry in sorted(glob_fn(pattern)):
+            if not include_hidden and entry.name.startswith("."):
+                continue
+            try:
+                stat = entry.stat()
+                entries.append({
+                    "name": entry.name,
+                    "path": str(entry),
+                    "type": "dir" if entry.is_dir() else ("symlink" if entry.is_symlink() else "file"),
+                    "size_bytes": stat.st_size if entry.is_file() else None,
+                    "modified_at": __import__("datetime").datetime.fromtimestamp(
+                        stat.st_mtime, tz=__import__("datetime").timezone.utc
+                    ).isoformat(),
+                })
+            except OSError:
+                continue
+
+        return ToolResult(data={"entries": entries, "count": len(entries)})
+
+
+========================================================================
+FILE: zeropoint/tools/webtools.py
+========================================================================
+"""
+WebtoolsTool — HTTP fetch, web search, and HTML scrape.
+Registered tool names: webtools_fetch, webtools_search, webtools_scrape
+"""
+
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import re
+import time
+from collections import deque
+from typing import Any
+from urllib.parse import urlparse
+
+import aiohttp
+from bs4 import BeautifulSoup
+
+from zeropoint.tools.base import BaseTool, ToolError, ToolResult
+
+
+class WebtoolsTool(BaseTool):
+    name = "webtools"
+    module = "webtools"
+    description = "HTTP fetch, web search, and HTML scrape."
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def _setup(self) -> None:
+        self._allowed: list[str] = self.config.get("allowed_domains", [])
+        self._blocked: list[str] = self.config.get("blocked_domains", [])
+        self._timeout: int = self.config.get("timeout_seconds", 30)
+        self._max_size: int = self.config.get("max_response_size_mb", 16) * 1024 * 1024
+        self._follow_redirects: bool = self.config.get("follow_redirects", True)
+        self._max_redirects: int = self.config.get("max_redirects", 5)
+        self._user_agent: str = self.config.get(
+            "user_agent", "ZeroPoint-MCP/1.0"
+        )
+        rl = self.config.get("rate_limit", {})
+        self._rpm: int = rl.get("requests_per_minute", 60)
+        self._burst: int = rl.get("burst", 10)
+        self._req_times: deque[float] = deque()
+        self._session: aiohttp.ClientSession | None = None
+
+    async def startup(self) -> None:
+        connector = aiohttp.TCPConnector(
+            ssl=True,
+            limit=20,
+            limit_per_host=5,
+        )
+        self._session = aiohttp.ClientSession(
+            connector=connector,
+            headers={"User-Agent": self._user_agent},
+            timeout=aiohttp.ClientTimeout(total=self._timeout),
+        )
+
+    async def shutdown(self) -> None:
+        if self._session:
+            await self._session.close()
+
+    # ------------------------------------------------------------------
+    # Guards
+    # ------------------------------------------------------------------
+
+    def _check_url(self, url: str) -> None:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+
+        # Block private/link-local IP ranges
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.is_private or ip.is_loopback or ip.is_link_local:
+                raise ToolError(f"Blocked: private/loopback IP '{host}'", code="URL_BLOCKED")
+        except ValueError:
+            pass  # Not a bare IP — hostname check below
+
+        for pattern in self._blocked:
+            pat = pattern.lstrip("*.")
+            if host == pat or host.endswith("." + pat):
+                raise ToolError(
+                    f"Domain '{host}' is blocked by policy.", code="URL_BLOCKED"
+                )
+
+        if self._allowed:
+            ok = any(
+                host == a.lstrip("*.") or host.endswith("." + a.lstrip("*."))
+                for a in self._allowed
+            )
+            if not ok:
+                raise ToolError(
+                    f"Domain '{host}' not in allowed_domains list.", code="URL_NOT_ALLOWED"
+                )
+
+    def _check_rate_limit(self) -> None:
+        now = time.monotonic()
+        window = 60.0
+        self._req_times = deque(
+            t for t in self._req_times if now - t < window
+        )
+        if len(self._req_times) >= self._rpm:
+            raise ToolError("Rate limit exceeded — slow down requests.", code="RATE_LIMITED")
+        self._req_times.append(now)
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+
+    async def execute(self, params: dict[str, Any]) -> ToolResult:
+        op = params.pop("_op", "fetch")
+        if op == "search":
+            return await self._search(params)
+        elif op == "scrape":
+            return await self._scrape(params)
+        else:
+            return await self._fetch(params)
+
+    # ------------------------------------------------------------------
+    # webtools_fetch
+    # ------------------------------------------------------------------
+
+    async def _fetch(self, params: dict) -> ToolResult:
+        self.require(params, "url")
+        url: str = params["url"]
+        self._check_url(url)
+        self._check_rate_limit()
+
+        method: str = params.get("method", "GET").upper()
+        headers: dict = params.get("headers", {})
+        body: str | None = params.get("body")
+        parse_as: str = params.get("parse_as", "auto")
+
+        assert self._session is not None
+        t0 = time.perf_counter()
+        try:
+            async with self._session.request(
+                method,
+                url,
+                headers=headers,
+                data=body,
+                allow_redirects=self._follow_redirects,
+                max_redirects=self._max_redirects,
+            ) as resp:
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                raw = await resp.read()
+                if len(raw) > self._max_size:
+                    raise ToolError("Response too large.", code="RESPONSE_TOO_LARGE")
+
+                content_type = resp.content_type or ""
+                if parse_as == "json" or (parse_as == "auto" and "json" in content_type):
+                    try:
+                        import json
+                        body_out = json.loads(raw)
+                    except Exception:
+                        body_out = raw.decode("utf-8", errors="replace")
+                else:
+                    body_out = raw.decode("utf-8", errors="replace")
+
+                return ToolResult(data={
+                    "status_code": resp.status,
+                    "headers": dict(resp.headers),
+                    "body": body_out,
+                    "latency_ms": latency_ms,
+                    "url": str(resp.url),
+                })
+
+        except aiohttp.ClientError as exc:
+            raise ToolError(f"HTTP request failed: {exc}", code="HTTP_ERROR")
+
+    # ------------------------------------------------------------------
+    # webtools_search — DuckDuckGo HTML (no API key required)
+    # ------------------------------------------------------------------
+
+    async def _search(self, params: dict) -> ToolResult:
+        self.require(params, "query")
+        query: str = params["query"]
+        max_results: int = min(params.get("max_results", 10), 50)
+
+        search_url = "https://html.duckduckgo.com/html/"
+        self._check_rate_limit()
+
+        assert self._session is not None
+        try:
+            async with self._session.post(
+                search_url,
+                data={"q": query, "b": "", "kl": params.get("language", "us-en")},
+                headers={"Accept": "text/html"},
+            ) as resp:
+                html = await resp.text()
+        except aiohttp.ClientError as exc:
+            raise ToolError(f"Search request failed: {exc}", code="HTTP_ERROR")
+
+        soup = BeautifulSoup(html, "lxml")
+        results = []
+        for i, result in enumerate(soup.select(".result__body")[:max_results]):
+            title_el = result.select_one(".result__title a")
+            snippet_el = result.select_one(".result__snippet")
+            if not title_el:
+                continue
+            href = title_el.get("href", "")
+            # DuckDuckGo wraps URLs — extract real URL
+            real_url = _extract_ddg_url(href)
+            results.append({
+                "rank": i + 1,
+                "title": title_el.get_text(strip=True),
+                "url": real_url,
+                "snippet": snippet_el.get_text(strip=True) if snippet_el else "",
+            })
+
+        return ToolResult(data={"results": results, "total_results": len(results), "query": query})
+
+    # ------------------------------------------------------------------
+    # webtools_scrape
+    # ------------------------------------------------------------------
+
+    async def _scrape(self, params: dict) -> ToolResult:
+        self.require(params, "url")
+        url: str = params["url"]
+        self._check_url(url)
+        self._check_rate_limit()
+
+        selectors: dict[str, str] = params.get("selectors", {})
+        return_markdown: bool = params.get("return_markdown", True)
+
+        fetch_params = {"url": url, "parse_as": "text"}
+        fetch_result = await self._fetch(fetch_params)
+        html = fetch_result.data.get("body", "")
+
+        soup = BeautifulSoup(html, "lxml")
+
+        extracted = {}
+        for label, css in selectors.items():
+            els = soup.select(css)
+            extracted[label] = [el.get_text(strip=True) for el in els]
+
+        markdown = ""
+        if return_markdown:
+            # Strip scripts/styles then convert to rough markdown
+            for tag in soup(["script", "style", "nav", "footer"]):
+                tag.decompose()
+            markdown = _html_to_markdown(soup)
+
+        return ToolResult(data={
+            "extracted": extracted,
+            "markdown": markdown,
+            "url": url,
+        })
+
+
+###############################################################################
+# Helpers
+###############################################################################
+
+def _extract_ddg_url(href: str) -> str:
+    if href.startswith("//duckduckgo.com/l/?"):
+        match = re.search(r"uddg=([^&]+)", href)
+        if match:
+            from urllib.parse import unquote
+            return unquote(match.group(1))
+    return href
+
+
+def _html_to_markdown(soup: BeautifulSoup) -> str:
+    """Very lightweight HTML → Markdown converter."""
+    lines = []
+    for el in soup.find_all(["h1", "h2", "h3", "h4", "p", "li", "a", "pre", "code"]):
+        tag = el.name
+        text = el.get_text(strip=True)
+        if not text:
+            continue
+        if tag == "h1":
+            lines.append(f"# {text}")
+        elif tag == "h2":
+            lines.append(f"## {text}")
+        elif tag == "h3":
+            lines.append(f"### {text}")
+        elif tag == "h4":
+            lines.append(f"#### {text}")
+        elif tag == "li":
+            lines.append(f"- {text}")
+        elif tag in ("pre", "code"):
+            lines.append(f"```\n{text}\n```")
+        else:
+            lines.append(text)
+    return "\n\n".join(lines)
+

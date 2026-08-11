@@ -1,0 +1,557 @@
+{
+  "$schema": "https://zeropoint.local/schemas/mcp-tool-registry/v1",
+  "server": "zeropoint-mcp",
+  "version": "1.0.0",
+  "generated_at": "2026-07-14T15:45:00-07:00",
+  "tools": [
+
+    {
+      "name": "filesystem_read",
+      "module": "filesystem",
+      "description": "Read the contents of a file at an allowed path.",
+      "input_schema": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute or workspace-relative file path to read."
+          },
+          "encoding": {
+            "type": "string",
+            "enum": ["utf-8", "base64", "auto"],
+            "default": "auto",
+            "description": "Encoding for returned content."
+          },
+          "start_line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "First line to return (1-indexed, text files only)."
+          },
+          "end_line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Last line to return (inclusive)."
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "content": {"type": "string"},
+          "size_bytes": {"type": "integer"},
+          "mime_type": {"type": "string"},
+          "line_count": {"type": "integer"}
+        }
+      },
+      "tags": ["filesystem", "read", "io"]
+    },
+
+    {
+      "name": "filesystem_write",
+      "module": "filesystem",
+      "description": "Write or append content to a file.",
+      "input_schema": {
+        "type": "object",
+        "required": ["path", "content"],
+        "properties": {
+          "path": {"type": "string"},
+          "content": {"type": "string"},
+          "encoding": {
+            "type": "string",
+            "enum": ["utf-8", "base64"],
+            "default": "utf-8"
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["overwrite", "append", "create_new"],
+            "default": "overwrite"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "bytes_written": {"type": "integer"},
+          "path": {"type": "string"}
+        }
+      },
+      "tags": ["filesystem", "write", "io"]
+    },
+
+    {
+      "name": "filesystem_list",
+      "module": "filesystem",
+      "description": "List directory contents with metadata.",
+      "input_schema": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": {"type": "string"},
+          "pattern": {
+            "type": "string",
+            "description": "Glob filter pattern (e.g. '**/*.py').",
+            "default": "*"
+          },
+          "recursive": {"type": "boolean", "default": false},
+          "include_hidden": {"type": "boolean", "default": false}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {"type": "string"},
+                "type": {"type": "string", "enum": ["file", "dir", "symlink"]},
+                "size_bytes": {"type": "integer"},
+                "modified_at": {"type": "string", "format": "date-time"}
+              }
+            }
+          }
+        }
+      },
+      "tags": ["filesystem", "list", "io"]
+    },
+
+    {
+      "name": "webtools_fetch",
+      "module": "webtools",
+      "description": "Fetch a URL and return the response body.",
+      "input_schema": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "url": {"type": "string", "format": "uri"},
+          "method": {
+            "type": "string",
+            "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+            "default": "GET"
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {"type": "string"}
+          },
+          "body": {"type": "string"},
+          "parse_as": {
+            "type": "string",
+            "enum": ["text", "json", "html", "auto"],
+            "default": "auto"
+          },
+          "timeout_seconds": {"type": "integer", "default": 30}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "status_code": {"type": "integer"},
+          "headers": {"type": "object"},
+          "body": {},
+          "latency_ms": {"type": "integer"}
+        }
+      },
+      "tags": ["webtools", "http", "fetch"]
+    },
+
+    {
+      "name": "webtools_search",
+      "module": "webtools",
+      "description": "Search the web and return ranked results with snippets.",
+      "input_schema": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": {"type": "string"},
+          "max_results": {"type": "integer", "default": 10, "maximum": 50},
+          "safe_search": {"type": "boolean", "default": true},
+          "language": {"type": "string", "default": "en"}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "title": {"type": "string"},
+                "url": {"type": "string"},
+                "snippet": {"type": "string"},
+                "rank": {"type": "integer"}
+              }
+            }
+          },
+          "total_results": {"type": "integer"}
+        }
+      },
+      "tags": ["webtools", "search"]
+    },
+
+    {
+      "name": "webtools_scrape",
+      "module": "webtools",
+      "description": "Scrape structured data from an HTML page using CSS selectors.",
+      "input_schema": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "url": {"type": "string", "format": "uri"},
+          "selectors": {
+            "type": "object",
+            "description": "Map of label → CSS selector to extract.",
+            "additionalProperties": {"type": "string"}
+          },
+          "return_markdown": {"type": "boolean", "default": true}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "extracted": {"type": "object"},
+          "markdown": {"type": "string"}
+        }
+      },
+      "tags": ["webtools", "scrape", "html"]
+    },
+
+    {
+      "name": "adb_shell",
+      "module": "adb",
+      "description": "Execute a shell command on an Android device via ADB.",
+      "input_schema": {
+        "type": "object",
+        "required": ["command"],
+        "properties": {
+          "command": {"type": "string"},
+          "device_id": {
+            "type": "string",
+            "description": "Device serial or CamNet node ID. Omit for auto-select."
+          },
+          "timeout_seconds": {"type": "integer", "default": 30},
+          "as_root": {"type": "boolean", "default": false}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "stdout": {"type": "string"},
+          "stderr": {"type": "string"},
+          "exit_code": {"type": "integer"},
+          "device_serial": {"type": "string"}
+        }
+      },
+      "tags": ["adb", "shell", "android"]
+    },
+
+    {
+      "name": "adb_push",
+      "module": "adb",
+      "description": "Push a local file to an Android device.",
+      "input_schema": {
+        "type": "object",
+        "required": ["local_path", "remote_path"],
+        "properties": {
+          "local_path": {"type": "string"},
+          "remote_path": {"type": "string"},
+          "device_id": {"type": "string"}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "bytes_transferred": {"type": "integer"},
+          "remote_path": {"type": "string"}
+        }
+      },
+      "tags": ["adb", "push", "android", "io"]
+    },
+
+    {
+      "name": "adb_pull",
+      "module": "adb",
+      "description": "Pull a file from an Android device to local workspace.",
+      "input_schema": {
+        "type": "object",
+        "required": ["remote_path", "local_path"],
+        "properties": {
+          "remote_path": {"type": "string"},
+          "local_path": {"type": "string"},
+          "device_id": {"type": "string"}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "bytes_transferred": {"type": "integer"},
+          "local_path": {"type": "string"}
+        }
+      },
+      "tags": ["adb", "pull", "android", "io"]
+    },
+
+    {
+      "name": "adb_logcat",
+      "module": "adb",
+      "description": "Capture logcat output from an Android device.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "device_id": {"type": "string"},
+          "filter": {
+            "type": "string",
+            "description": "Logcat filter spec (e.g. '*:E MyTag:D')."
+          },
+          "lines": {"type": "integer", "default": 500},
+          "timeout_seconds": {"type": "integer", "default": 10}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "log": {"type": "string"},
+          "line_count": {"type": "integer"}
+        }
+      },
+      "tags": ["adb", "logcat", "android", "debug"]
+    },
+
+    {
+      "name": "adb_screencap",
+      "module": "adb",
+      "description": "Take a screenshot of an Android device screen.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "device_id": {"type": "string"},
+          "save_path": {
+            "type": "string",
+            "description": "Local path to save PNG. Auto-generated if omitted."
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "local_path": {"type": "string"},
+          "width": {"type": "integer"},
+          "height": {"type": "integer"}
+        }
+      },
+      "tags": ["adb", "screenshot", "android"]
+    },
+
+    {
+      "name": "adb_install",
+      "module": "adb",
+      "description": "Install an APK on an Android device.",
+      "input_schema": {
+        "type": "object",
+        "required": ["apk_path"],
+        "properties": {
+          "apk_path": {"type": "string"},
+          "device_id": {"type": "string"},
+          "grant_permissions": {"type": "boolean", "default": true},
+          "replace_existing": {"type": "boolean", "default": true}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "success": {"type": "boolean"},
+          "package_name": {"type": "string"},
+          "version": {"type": "string"}
+        }
+      },
+      "tags": ["adb", "install", "android", "apk"]
+    },
+
+    {
+      "name": "android_tap",
+      "module": "android",
+      "description": "Tap a UI element or coordinate on a device screen.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "device_id": {"type": "string"},
+          "x": {"type": "number"},
+          "y": {"type": "number"},
+          "selector": {
+            "type": "object",
+            "description": "UiAutomator2 selector (e.g. {text: 'OK'} or {resourceId: 'com.app:id/btn'})."
+          },
+          "wait_seconds": {"type": "number", "default": 5}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "tapped": {"type": "boolean"},
+          "element_found": {"type": "boolean"}
+        }
+      },
+      "tags": ["android", "ui", "tap", "automation"]
+    },
+
+    {
+      "name": "android_swipe",
+      "module": "android",
+      "description": "Swipe gesture on a device screen.",
+      "input_schema": {
+        "type": "object",
+        "required": ["start_x", "start_y", "end_x", "end_y"],
+        "properties": {
+          "device_id": {"type": "string"},
+          "start_x": {"type": "number"},
+          "start_y": {"type": "number"},
+          "end_x": {"type": "number"},
+          "end_y": {"type": "number"},
+          "duration_ms": {"type": "integer", "default": 300}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {"success": {"type": "boolean"}}
+      },
+      "tags": ["android", "ui", "swipe", "automation"]
+    },
+
+    {
+      "name": "android_input_text",
+      "module": "android",
+      "description": "Type text into the currently focused input field.",
+      "input_schema": {
+        "type": "object",
+        "required": ["text"],
+        "properties": {
+          "device_id": {"type": "string"},
+          "text": {"type": "string"},
+          "clear_first": {"type": "boolean", "default": true}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {"success": {"type": "boolean"}}
+      },
+      "tags": ["android", "ui", "input", "automation"]
+    },
+
+    {
+      "name": "android_camera_capture",
+      "module": "android",
+      "description": "Trigger camera capture on one or more CamNet devices.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "device_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "List of device IDs. Omit for all CamNet devices."
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["photo", "video", "burst"],
+            "default": "photo"
+          },
+          "duration_seconds": {
+            "type": "number",
+            "description": "Duration for video/burst modes."
+          },
+          "synchronized": {
+            "type": "boolean",
+            "default": true,
+            "description": "Trigger all devices simultaneously."
+          },
+          "save_to": {"type": "string", "description": "Override local save directory."}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "captures": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "device_id": {"type": "string"},
+                "local_path": {"type": "string"},
+                "timestamp": {"type": "string", "format": "date-time"},
+                "success": {"type": "boolean"}
+              }
+            }
+          }
+        }
+      },
+      "tags": ["android", "camera", "camnet", "capture"]
+    },
+
+    {
+      "name": "camnet_status",
+      "module": "android",
+      "description": "Query status of all CamNet devices — connectivity, battery, storage.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "device_ids": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "devices": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "device_id": {"type": "string"},
+                "serial": {"type": "string"},
+                "connected": {"type": "boolean"},
+                "battery_pct": {"type": "integer"},
+                "storage_free_gb": {"type": "number"},
+                "android_version": {"type": "string"},
+                "last_seen": {"type": "string", "format": "date-time"}
+              }
+            }
+          },
+          "network_id": {"type": "string"},
+          "active_count": {"type": "integer"}
+        }
+      },
+      "tags": ["camnet", "status", "android"]
+    },
+
+    {
+      "name": "camnet_sync",
+      "module": "android",
+      "description": "Pull captured media from all CamNet devices to the coordinator.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "device_ids": {"type": "array", "items": {"type": "string"}},
+          "media_type": {
+            "type": "string",
+            "enum": ["photo", "video", "all"],
+            "default": "all"
+          },
+          "delete_after_sync": {"type": "boolean", "default": false},
+          "destination": {"type": "string", "default": "/data/camnet"}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "synced_files": {"type": "integer"},
+          "bytes_transferred": {"type": "integer"},
+          "errors": {"type": "array", "items": {"type": "string"}}
+        }
+      },
+      "tags": ["camnet", "sync", "android", "io"]
+    }
+  ]
+}
