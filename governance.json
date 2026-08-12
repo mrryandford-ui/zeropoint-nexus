@@ -9,6 +9,29 @@
       "require_approval": false
     }
   },
+  "access_control": {
+    "framework_roles": [
+      "owner",
+      "security_lead",
+      "security_analyst",
+      "recovery_tech",
+      "automation_operator",
+      "viewer"
+    ],
+    "workflow_roles": {
+      "pentest_phase1": ["owner", "security_lead", "security_analyst"],
+      "recovery_phase1": ["owner", "security_lead", "recovery_tech"]
+    },
+    "filesystem_roles": {
+      "read": ["owner", "security_lead", "security_analyst", "recovery_tech", "automation_operator"],
+      "list": ["owner", "security_lead", "security_analyst", "recovery_tech", "automation_operator"],
+      "write": ["owner", "security_lead", "automation_operator"]
+    },
+    "ollama_model_access": {
+      "read_allowed_roles": ["owner", "security_lead", "security_analyst", "recovery_tech", "automation_operator"],
+      "write_allowed_roles": ["owner", "security_lead"]
+    }
+  },
   "cluster": "ZeroPoint-MCP",
   "nodes": {
     "ZERO-DEV": {

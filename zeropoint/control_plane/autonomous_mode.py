@@ -10,8 +10,10 @@ This module provides:
 from __future__ import annotations
 
 import ipaddress
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
@@ -136,8 +138,9 @@ class AuditEvent:
 class AutonomousWorkflowManager:
     """Phase 1 autonomous planner/executor."""
 
-    def __init__(self) -> None:
+    def __init__(self, governance_path: str | Path | None = None) -> None:
         self._events: list[AuditEvent] = []
+        self._governance = _load_governance(governance_path)
 
     def _log(self, phase: str, action: str, status: str, **details: Any) -> None:
         self._events.append(AuditEvent(phase=phase, action=action, status=status, details=details))
@@ -145,11 +148,38 @@ class AutonomousWorkflowManager:
     def _clear(self) -> None:
         self._events = []
 
-    def _require_authorized(self, authorized: bool, scope_id: str) -> None:
+    def _allowed_roles(self, workflow_key: str) -> set[str]:
+        access = self._governance.get("access_control", {})
+        workflow_roles = access.get("workflow_roles", {})
+        configured = workflow_roles.get(workflow_key, [])
+        if configured:
+            return {str(r).strip().lower() for r in configured}
+
+        defaults = {
+            "pentest_phase1": {"owner", "security_lead", "security_analyst"},
+            "recovery_phase1": {"owner", "security_lead", "recovery_tech"},
+        }
+        return defaults.get(workflow_key, {"owner"})
+
+    def _require_authorized(
+        self,
+        authorized: bool,
+        scope_id: str,
+        actor_role: str,
+        workflow_key: str,
+    ) -> None:
         if not authorized:
             raise AuthorizationError("authorized=True is required.")
         if not scope_id.strip():
             raise AuthorizationError("scope_id is required for auditability.")
+        role = (actor_role or "").strip().lower()
+        if not role:
+            raise AuthorizationError("actor_role is required.")
+        allowed = self._allowed_roles(workflow_key)
+        if role not in allowed:
+            raise AuthorizationError(
+                f"Role '{actor_role}' is not allowed for {workflow_key}. Allowed: {sorted(allowed)}"
+            )
 
     def plan_pentest(self, target: str, allow_public: bool = False) -> dict[str, Any]:
         scope = validate_target_scope(target, allow_public=allow_public)
@@ -167,6 +197,8 @@ class AutonomousWorkflowManager:
             "safety": {
                 "requires_authorized_flag": True,
                 "requires_scope_id": True,
+                "requires_actor_role": True,
+                "allowed_roles": sorted(self._allowed_roles("pentest_phase1")),
                 "public_scope_blocked_by_default": True,
             },
         }
@@ -176,14 +208,28 @@ class AutonomousWorkflowManager:
         target: str,
         scope_id: str,
         authorized: bool,
+        actor_role: str = "owner",
         active: bool = False,
         use_kali: bool = False,
+        use_metasploit: bool = False,
+        use_hashcat: bool = False,
+        use_john: bool = False,
+        hash_file: str | None = None,
+        hash_mode: int = 0,
+        wordlist: str | None = None,
         allow_public: bool = False,
     ) -> dict[str, Any]:
         self._clear()
-        self._require_authorized(authorized, scope_id)
+        self._require_authorized(authorized, scope_id, actor_role, "pentest_phase1")
         scope = validate_target_scope(target, allow_public=allow_public)
-        self._log("scope", "validate_target_scope", "ok", scope=scope, scope_id=scope_id)
+        self._log(
+            "scope",
+            "validate_target_scope",
+            "ok",
+            scope=scope,
+            scope_id=scope_id,
+            actor_role=actor_role,
+        )
 
         from zeropoint.osint.pipeline import OSINTPipeline
 
@@ -199,27 +245,106 @@ class AutonomousWorkflowManager:
         )
 
         kali_summary: dict[str, Any] = {"executed": False}
-        if use_kali:
+        metasploit_summary: dict[str, Any] = {"executed": False}
+        hashcat_summary: dict[str, Any] = {"executed": False}
+        john_summary: dict[str, Any] = {"executed": False}
+
+        if use_kali or use_metasploit or use_hashcat or use_john:
             from zeropoint.pentest.kali_runner import KaliRunner
 
-            self._log("kali", "nmap", "started")
             runner = KaliRunner()
-            nmap_result = await runner.nmap(
-                target=target,
-                ports="1-1024",
-                flags="-sV",
-                authorized=True,
-            )
-            kali_summary = {
-                "executed": True,
-                "tool": "nmap",
-                "success": nmap_result.success,
-                "returncode": nmap_result.returncode,
-                "duration_seconds": nmap_result.duration_seconds,
-                "parsed": nmap_result.parsed,
-                "stderr": nmap_result.stderr[:500],
-            }
-            self._log("kali", "nmap", "ok" if nmap_result.success else "failed", returncode=nmap_result.returncode)
+
+            if use_kali:
+                self._log("kali", "nmap", "started")
+                nmap_result = await runner.nmap(
+                    target=target,
+                    ports="1-1024",
+                    flags="-sV",
+                    authorized=True,
+                )
+                kali_summary = {
+                    "executed": True,
+                    "tool": "nmap",
+                    "success": nmap_result.success,
+                    "returncode": nmap_result.returncode,
+                    "duration_seconds": nmap_result.duration_seconds,
+                    "parsed": nmap_result.parsed,
+                    "stderr": nmap_result.stderr[:500],
+                }
+                self._log(
+                    "kali",
+                    "nmap",
+                    "ok" if nmap_result.success else "failed",
+                    returncode=nmap_result.returncode,
+                )
+
+            if use_metasploit:
+                self._log("metasploit", "modules_search", "started")
+                msf_result = await runner.metasploit_modules(
+                    query="type:exploit",
+                    authorized=True,
+                )
+                metasploit_summary = {
+                    "executed": True,
+                    "success": msf_result.success,
+                    "returncode": msf_result.returncode,
+                    "matches": msf_result.parsed.get("count", 0),
+                    "sample": msf_result.parsed.get("matches", [])[:10],
+                    "stderr": msf_result.stderr[:500],
+                }
+                self._log(
+                    "metasploit",
+                    "modules_search",
+                    "ok" if msf_result.success else "failed",
+                    returncode=msf_result.returncode,
+                )
+
+            if (use_hashcat or use_john) and not hash_file:
+                self._log("credential", "hash_input", "failed", reason="hash_file_missing")
+                raise ScopeValidationError("hash_file is required when use_hashcat/use_john is enabled.")
+
+            if use_hashcat:
+                self._log("credential", "hashcat", "started")
+                hashcat_result = await runner.hashcat_crack(
+                    hash_file=hash_file or "",
+                    mode=hash_mode,
+                    wordlist=wordlist,
+                    authorized=True,
+                )
+                hashcat_summary = {
+                    "executed": True,
+                    "success": hashcat_result.success,
+                    "returncode": hashcat_result.returncode,
+                    "cracked_count": hashcat_result.parsed.get("count", 0),
+                    "stderr": hashcat_result.stderr[:500],
+                }
+                self._log(
+                    "credential",
+                    "hashcat",
+                    "ok" if hashcat_result.success else "failed",
+                    returncode=hashcat_result.returncode,
+                )
+
+            if use_john:
+                self._log("credential", "john", "started")
+                john_result = await runner.john_crack(
+                    hash_file=hash_file or "",
+                    wordlist=wordlist,
+                    authorized=True,
+                )
+                john_summary = {
+                    "executed": True,
+                    "success": john_result.success,
+                    "returncode": john_result.returncode,
+                    "cracked_count": john_result.parsed.get("count", 0),
+                    "stderr": john_result.stderr[:500],
+                }
+                self._log(
+                    "credential",
+                    "john",
+                    "ok" if john_result.success else "failed",
+                    returncode=john_result.returncode,
+                )
 
         open_ports = []
         for item in osint_result.get("results", []):
@@ -233,17 +358,24 @@ class AutonomousWorkflowManager:
             "active_mode": active,
             "open_ports_detected": open_ports,
             "kali_executed": kali_summary.get("executed", False),
+            "metasploit_executed": metasploit_summary.get("executed", False),
+            "hashcat_executed": hashcat_summary.get("executed", False),
+            "john_executed": john_summary.get("executed", False),
         }
         self._log("report", "summary", "ok", summary=summary)
 
         return {
             "workflow": "autonomous_pentest_phase1",
             "authorized": True,
+            "actor_role": actor_role,
             "scope_id": scope_id,
             "target_scope": scope,
             "summary": summary,
             "osint": osint_result,
             "kali": kali_summary,
+            "metasploit": metasploit_summary,
+            "hashcat": hashcat_summary,
+            "john": john_summary,
             "audit_trail": [e.to_dict() for e in self._events],
             "completed_at": _ts(),
         }
@@ -262,6 +394,8 @@ class AutonomousWorkflowManager:
             ],
             "safety": {
                 "destructive_actions_not_included": True,
+                "requires_actor_role": True,
+                "allowed_roles": sorted(self._allowed_roles("recovery_phase1")),
                 "factory_reset_requires_separate_confirmed_path": True,
             },
         }
@@ -271,10 +405,11 @@ class AutonomousWorkflowManager:
         device_serial: str,
         authorized: bool,
         scope_id: str,
+        actor_role: str = "owner",
         attempt_reconnect: bool = True,
     ) -> dict[str, Any]:
         self._clear()
-        self._require_authorized(authorized, scope_id)
+        self._require_authorized(authorized, scope_id, actor_role, "recovery_phase1")
         serial = (device_serial or "").strip()
         if not serial:
             raise ScopeValidationError("device_serial is required.")
@@ -306,6 +441,7 @@ class AutonomousWorkflowManager:
         return {
             "workflow": "autonomous_device_recovery_phase1",
             "authorized": True,
+            "actor_role": actor_role,
             "scope_id": scope_id,
             "device_serial": serial,
             "initial_state": str(before),
@@ -316,3 +452,16 @@ class AutonomousWorkflowManager:
             "audit_trail": [e.to_dict() for e in self._events],
             "completed_at": _ts(),
         }
+
+
+def _load_governance(governance_path: str | Path | None) -> dict[str, Any]:
+    if governance_path:
+        path = Path(governance_path)
+    else:
+        path = Path(__file__).resolve().parents[2] / "governance.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}

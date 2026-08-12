@@ -357,18 +357,38 @@ def auto_pentest_plan(target: str, allow_public: bool):
 @click.option("--scope-id", required=True, help="Authorization scope/ticket ID.")
 @click.option("--authorized", is_flag=True, default=False,
               help="Explicitly confirm you are authorized to test this target scope.")
+@click.option("--actor-role", default="owner", show_default=True,
+              help="Role executing this workflow (must be allowed by governance policy).")
 @click.option("--active", is_flag=True, default=False,
               help="Include active recon modules.")
 @click.option("--use-kali", is_flag=True, default=False,
               help="Run Kali nmap quick scan in addition to OSINT.")
+@click.option("--use-metasploit", is_flag=True, default=False,
+              help="Run Metasploit module search stage.")
+@click.option("--use-hashcat", is_flag=True, default=False,
+              help="Run Hashcat cracking stage (requires --hash-file).")
+@click.option("--use-john", is_flag=True, default=False,
+              help="Run John the Ripper cracking stage (requires --hash-file).")
+@click.option("--hash-file", default=None, help="Path to hash input file for cracking stages.")
+@click.option("--hash-mode", default=0, type=int,
+              help="Hashcat mode id (e.g. 0 for MD5).")
+@click.option("--wordlist", default=None,
+              help="Optional wordlist path for hashcat/john.")
 @click.option("--allow-public", is_flag=True, default=False,
               help="Allow public scopes (blocked by default).")
 def auto_pentest_run(
     target: str,
     scope_id: str,
     authorized: bool,
+    actor_role: str,
     active: bool,
     use_kali: bool,
+    use_metasploit: bool,
+    use_hashcat: bool,
+    use_john: bool,
+    hash_file: str | None,
+    hash_mode: int,
+    wordlist: str | None,
     allow_public: bool,
 ):
     """Execute phase-1 autonomous pentest workflow."""
@@ -381,8 +401,15 @@ def auto_pentest_run(
             target=target,
             scope_id=scope_id,
             authorized=authorized,
+            actor_role=actor_role,
             active=active,
             use_kali=use_kali,
+            use_metasploit=use_metasploit,
+            use_hashcat=use_hashcat,
+            use_john=use_john,
+            hash_file=hash_file,
+            hash_mode=hash_mode,
+            wordlist=wordlist,
             allow_public=allow_public,
         )
 
@@ -414,12 +441,15 @@ def auto_recovery_plan(device_serial: str):
 @click.option("--scope-id", required=True, help="Authorization scope/ticket ID.")
 @click.option("--authorized", is_flag=True, default=False,
               help="Explicitly confirm you are authorized to operate on this device.")
+@click.option("--actor-role", default="owner", show_default=True,
+              help="Role executing this workflow (must be allowed by governance policy).")
 @click.option("--attempt-reconnect/--no-attempt-reconnect", default=True,
               help="Run safe ADB reconnect workflow.")
 def auto_recovery_run(
     device_serial: str,
     scope_id: str,
     authorized: bool,
+    actor_role: str,
     attempt_reconnect: bool,
 ):
     """Execute phase-1 autonomous device recovery workflow."""
@@ -432,6 +462,7 @@ def auto_recovery_run(
             device_serial=device_serial,
             authorized=authorized,
             scope_id=scope_id,
+            actor_role=actor_role,
             attempt_reconnect=attempt_reconnect,
         )
 

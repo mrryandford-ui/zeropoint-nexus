@@ -163,3 +163,47 @@ class TestList:
         f.write_text("x")
         result = await tool.safe_execute({"_op": "list", "path": str(f)})
         assert result["isError"] is True
+
+
+class TestAccessControl:
+    @pytest.mark.asyncio
+    async def test_write_role_denied(self, tmp):
+        tool = FilesystemTool(config={
+            "allowed_roots": [str(tmp)],
+            "access_control": {
+                "enabled": True,
+                "default_role": "viewer",
+                "read_roles": ["viewer", "owner"],
+                "list_roles": ["viewer", "owner"],
+                "write_roles": ["owner"],
+            },
+        })
+        path = str(tmp / "denied.txt")
+        result = await tool.safe_execute({
+            "_op": "write",
+            "_requester_role": "viewer",
+            "path": path,
+            "content": "blocked",
+        })
+        assert result["isError"] is True
+
+    @pytest.mark.asyncio
+    async def test_write_role_allowed(self, tmp):
+        tool = FilesystemTool(config={
+            "allowed_roots": [str(tmp)],
+            "access_control": {
+                "enabled": True,
+                "default_role": "owner",
+                "read_roles": ["owner"],
+                "list_roles": ["owner"],
+                "write_roles": ["owner"],
+            },
+        })
+        path = str(tmp / "allowed.txt")
+        result = await tool.safe_execute({
+            "_op": "write",
+            "_requester_role": "owner",
+            "path": path,
+            "content": "ok",
+        })
+        assert "isError" not in result

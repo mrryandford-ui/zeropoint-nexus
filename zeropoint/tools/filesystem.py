@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import fnmatch
+import json
 import mimetypes
 import os
 from pathlib import Path
@@ -26,28 +27,89 @@ class FilesystemTool(BaseTool):
 
     def _setup(self) -> None:
         raw_roots: list[str] = self.config.get("allowed_roots", [])
-        self._roots: list[Path] = [Path(r).resolve() for r in raw_roots]
+        if not raw_roots:
+            raw_roots = [str(Path.cwd())]
+
+        include_ollama_roots = self.config.get("include_ollama_model_roots", True)
+        ollama_roots = self._detect_ollama_roots() if include_ollama_roots else []
+
+        read_raw = self.config.get("read_allowed_roots", raw_roots + ollama_roots)
+        write_raw = self.config.get("write_allowed_roots", raw_roots)
+        list_raw = self.config.get("list_allowed_roots", read_raw)
+
+        self._read_roots: list[Path] = [Path(r).resolve() for r in read_raw]
+        self._write_roots: list[Path] = [Path(r).resolve() for r in write_raw]
+        self._list_roots: list[Path] = [Path(r).resolve() for r in list_raw]
+
         self._deny: list[str] = self.config.get("deny_patterns", [])
         self._max_bytes: int = self.config.get("max_file_size_mb", 256) * 1024 * 1024
         self._allow_symlinks: bool = self.config.get("allow_symlinks", False)
+        self._allow_write: bool = self.config.get("allow_write", True)
 
-        if not self._roots:
-            raise RuntimeError("filesystem: allowed_roots must not be empty")
+        access = self.config.get("access_control", {})
+        if not access:
+            access = self._load_access_from_governance()
+        self._rbac_enabled: bool = access.get("enabled", False)
+        self._default_role: str = str(access.get("default_role", "owner")).strip().lower()
+        self._read_roles: set[str] = {str(x).strip().lower() for x in access.get("read_roles", [])}
+        self._list_roles: set[str] = {str(x).strip().lower() for x in access.get("list_roles", [])}
+        self._write_roles: set[str] = {str(x).strip().lower() for x in access.get("write_roles", [])}
+
+        if not self._read_roots or not self._list_roots:
+            raise RuntimeError("filesystem: read/list allowed roots must not be empty")
+
+    def _detect_ollama_roots(self) -> list[str]:
+        roots: list[str] = []
+        from_env = os.environ.get("OLLAMA_MODELS")
+        if from_env:
+            roots.append(from_env)
+
+        home = Path.home()
+        roots.extend([
+            str(home / ".ollama" / "models"),
+            "/var/lib/ollama",
+            "/usr/share/ollama/.ollama/models",
+        ])
+
+        user_profile = os.environ.get("USERPROFILE")
+        if user_profile:
+            roots.append(str(Path(user_profile) / ".ollama" / "models"))
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            roots.append(str(Path(local_app_data) / "Ollama" / "models"))
+        return roots
+
+    def _load_access_from_governance(self) -> dict[str, Any]:
+        gov_path = Path(__file__).resolve().parents[2] / "governance.json"
+        if not gov_path.exists():
+            return {}
+        try:
+            payload = json.loads(gov_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        fs_roles = payload.get("access_control", {}).get("filesystem_roles", {})
+        if not fs_roles:
+            return {}
+        return {
+            "enabled": True,
+            "default_role": "owner",
+            "read_roles": fs_roles.get("read", []),
+            "list_roles": fs_roles.get("list", []),
+            "write_roles": fs_roles.get("write", []),
+        }
 
     # ------------------------------------------------------------------
     # Guard
     # ------------------------------------------------------------------
 
-    def _check_path(self, path_str: str) -> Path:
+    def _check_path(self, path_str: str, allowed_roots: list[Path]) -> Path:
         """Resolve and validate a path against allowed roots and deny list."""
         p = Path(path_str).resolve()
 
-        in_root = any(
-            str(p).startswith(str(root)) for root in self._roots
-        )
+        in_root = any(p == root or p.is_relative_to(root) for root in allowed_roots)
         if not in_root:
             raise ToolError(
-                f"Path '{p}' is outside allowed roots: {[str(r) for r in self._roots]}",
+                f"Path '{p}' is outside allowed roots: {[str(r) for r in allowed_roots]}",
                 code="PATH_DENIED",
             )
 
@@ -64,6 +126,24 @@ class FilesystemTool(BaseTool):
                     code="PATH_DENIED",
                 )
         return p
+
+    def _check_role(self, params: dict[str, Any], op: str) -> None:
+        if not self._rbac_enabled:
+            return
+
+        role = str(params.get("_requester_role", self._default_role)).strip().lower()
+        if op == "read":
+            allowed = self._read_roles
+        elif op == "list":
+            allowed = self._list_roles
+        else:
+            allowed = self._write_roles
+
+        if allowed and role not in allowed:
+            raise ToolError(
+                f"Role '{role}' is not allowed to perform filesystem {op}. Allowed roles: {sorted(allowed)}",
+                code="ROLE_DENIED",
+            )
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -85,7 +165,8 @@ class FilesystemTool(BaseTool):
 
     async def _read(self, params: dict) -> ToolResult:
         self.require(params, "path")
-        p = self._check_path(params["path"])
+        self._check_role(params, "read")
+        p = self._check_path(params["path"], self._read_roots)
 
         if not p.exists():
             raise ToolError(f"Path does not exist: '{p}'", code="NOT_FOUND")
@@ -135,7 +216,10 @@ class FilesystemTool(BaseTool):
 
     async def _write(self, params: dict) -> ToolResult:
         self.require(params, "path", "content")
-        p = self._check_path(params["path"])
+        self._check_role(params, "write")
+        if not self._allow_write:
+            raise ToolError("Filesystem writes are disabled by policy.", code="WRITE_DISABLED")
+        p = self._check_path(params["path"], self._write_roots)
         mode: str = params.get("mode", "overwrite")
         encoding: str = params.get("encoding", "utf-8")
 
@@ -167,7 +251,8 @@ class FilesystemTool(BaseTool):
 
     async def _list(self, params: dict) -> ToolResult:
         self.require(params, "path")
-        p = self._check_path(params["path"])
+        self._check_role(params, "list")
+        p = self._check_path(params["path"], self._list_roots)
 
         if not p.exists():
             raise ToolError(f"Path does not exist: '{p}'", code="NOT_FOUND")
@@ -198,4 +283,3 @@ class FilesystemTool(BaseTool):
                 continue
 
         return ToolResult(data={"entries": entries, "count": len(entries)})
-

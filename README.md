@@ -87,6 +87,19 @@ zeropoint-control auto recovery-plan 192.168.100.10:5555
 zeropoint-control auto recovery-run 192.168.100.10:5555 --scope-id AUTH-DR-001 --authorized
 ```
 
+Role-based execution is enforced for autonomous runs. Set role explicitly when needed:
+
+```powershell
+zeropoint-control auto pentest-run 192.168.0.0/24 --scope-id AUTH-001 --authorized --actor-role security_analyst --active --use-kali --use-metasploit
+```
+
+## Filesystem + Ollama model access policy
+
+- The filesystem tool now supports role-aware read/list/write controls.
+- Ollama model directories are included in **read/list** roots by default.
+- Writes should remain restricted to operator/workspace paths (not model stores).
+- Role policy is defined in [governance.json](governance.json) under `access_control`.
+
 ## Notes
 
 - `pyproject.toml` expects this file as the project README.
