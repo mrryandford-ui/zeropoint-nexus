@@ -155,15 +155,31 @@ if ($mcpJob.State -eq "Running") {
     Receive-Job $mcpJob; exit 1
 }
 
+# Identity service (port 8766)
+INF "Starting Identity service on port 8766..."
+$identityJob = Start-Job -Name "ZP_IDENTITY" -ScriptBlock {
+    param($py, $root)
+    $env:PYTHONPATH = $root
+    & $py $root\zeropoint_mcp_server.py
+} -ArgumentList $PY, $ROOT
+Start-Sleep 2
+if ($identityJob.State -eq "Running") {
+    OK "Identity service started on port 8766"
+} else {
+    WRN "Identity service failed -- cluster identity checks will fail"
+    Receive-Job $identityJob
+}
+
 # Optional Ray head
 if ($RayHead) {
     $rayExe = "$VENV\Scripts\ray.exe"
     if (Test-Path $rayExe) {
-        INF "Starting Ray head node on port 6379..."
+        INF "Starting Ray head node on port 6379 with advertised IP $activeIp..."
         $rayJob = Start-Job -Name "ZP_RAY" -ScriptBlock {
-            param($ray)
-            & $ray start --head --port=6379 --dashboard-port=8265 --num-cpus=4
-        } -ArgumentList $rayExe
+            param($ray, $ip)
+            $env:RAY_BIND_ADDRESS = "0.0.0.0"
+            & $ray start --head --port=6379 --dashboard-port=8265 --dashboard-host=0.0.0.0 --num-cpus=4 --node-ip-address=$ip
+        } -ArgumentList $rayExe, $activeIp
         Start-Sleep 3
         if ($rayJob.State -eq "Running") {
             OK "Ray head running -- dashboard: http://localhost:8265"
@@ -180,9 +196,10 @@ Write-Host "================================================================" -F
 Write-Host "  ZeroPoint is running!" -ForegroundColor Green
 Write-Host "================================================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "  MCP  : ws://localhost:8765/mcp" -ForegroundColor White
-Write-Host "  Token: $env:MCP_AUTH_TOKEN" -ForegroundColor White
-Write-Host "  Log  : $LOG" -ForegroundColor DarkGray
+Write-Host "  MCP      : ws://localhost:8765/mcp" -ForegroundColor White
+Write-Host "  Identity : http://localhost:8766" -ForegroundColor White
+Write-Host "  Token    : $env:MCP_AUTH_TOKEN" -ForegroundColor White
+Write-Host "  Log      : $LOG" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  Stop : .\dev_start.ps1 -Stop" -ForegroundColor Yellow
 Write-Host "  Tail : Get-Content $LOG -Wait" -ForegroundColor Yellow

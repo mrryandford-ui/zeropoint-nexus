@@ -72,8 +72,9 @@ def init_ray():
     else:
         return _tcp_check_ray(address)
 
-# Initial attempt to connect; subsequent health checks call init_ray() to refresh status
-RAY_INIT_RESULT = init_ray()
+# Lazy initialization: attempt to connect on first health check, not at module load time
+# This prevents blocking uvicorn startup while waiting for Ray
+RAY_INIT_RESULT = {"ok": False, "reason": "not_initialized_yet"}
 
 # Tools (HTTP endpoints)
 @app.post("/mcp/get_node_identity")
