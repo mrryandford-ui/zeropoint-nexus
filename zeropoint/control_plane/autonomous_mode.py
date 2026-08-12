@@ -218,6 +218,7 @@ class AutonomousWorkflowManager:
         hash_mode: int = 0,
         wordlist: str | None = None,
         allow_public: bool = False,
+        export_findings: bool = True,
     ) -> dict[str, Any]:
         self._clear()
         self._require_authorized(authorized, scope_id, actor_role, "pentest_phase1")
@@ -232,6 +233,10 @@ class AutonomousWorkflowManager:
         )
 
         from zeropoint.osint.pipeline import OSINTPipeline
+        from zeropoint.pentest.recon_orchestrator import ReconOrchestrator
+
+        # Initialize orchestrator for finding normalization
+        orchestrator = ReconOrchestrator(target, scope_id, actor_role)
 
         self._log("osint", "run_all", "started", active=active)
         async with OSINTPipeline() as pipeline:
@@ -277,6 +282,14 @@ class AutonomousWorkflowManager:
                     "ok" if nmap_result.success else "failed",
                     returncode=nmap_result.returncode,
                 )
+
+                # Normalize nmap findings
+                if nmap_result.success and nmap_result.stdout:
+                    from zeropoint.pentest.recon_orchestrator import NmapAdapter
+                    adapter = NmapAdapter()
+                    nmap_findings = adapter.parse_output(nmap_result.stdout, target)
+                    orchestrator.all_findings.extend(nmap_findings)
+                    self._log("finding_normalization", "nmap", "ok", finding_count=len(nmap_findings))
 
             if use_metasploit:
                 self._log("metasploit", "modules_search", "started")
@@ -361,8 +374,22 @@ class AutonomousWorkflowManager:
             "metasploit_executed": metasploit_summary.get("executed", False),
             "hashcat_executed": hashcat_summary.get("executed", False),
             "john_executed": john_summary.get("executed", False),
+            "total_findings": len(orchestrator.all_findings),
+            "risk_score": orchestrator._calculate_risk_score(),
         }
         self._log("report", "summary", "ok", summary=summary)
+
+        # Export findings if requested
+        findings_path = None
+        report_path = None
+        if export_findings and orchestrator.all_findings:
+            findings_dir = Path(__file__).parent.parent.parent / "logs" / "findings"
+            findings_dir.mkdir(parents=True, exist_ok=True)
+            findings_path = findings_dir / f"{scope_id}-findings.json"
+            report_path = findings_dir / f"{scope_id}-report.md"
+            orchestrator.export_findings(findings_path)
+            orchestrator.export_report_markdown(report_path)
+            self._log("export", "findings", "ok", path=str(findings_path))
 
         return {
             "workflow": "autonomous_pentest_phase1",
@@ -376,6 +403,9 @@ class AutonomousWorkflowManager:
             "metasploit": metasploit_summary,
             "hashcat": hashcat_summary,
             "john": john_summary,
+            "findings": [f.to_dict() for f in orchestrator.all_findings],
+            "findings_file": str(findings_path) if findings_path else None,
+            "report_file": str(report_path) if report_path else None,
             "audit_trail": [e.to_dict() for e in self._events],
             "completed_at": _ts(),
         }
