@@ -69,6 +69,24 @@ cd C:\Users\zeroi\Downloads\zeropoint-mcp
 .\verify_cluster_connection.ps1 -Connect
 ```
 
+## Autonomous workflows (Phase 1)
+
+These are scope-gated helpers for authorized operations:
+
+```powershell
+# build an autonomous pentest plan
+zeropoint-control auto pentest-plan 192.168.0.0/24
+
+# run autonomous pentest phase 1 (authorized flag + scope id required)
+zeropoint-control auto pentest-run 192.168.0.0/24 --scope-id AUTH-001 --authorized --active
+
+# build autonomous device recovery plan
+zeropoint-control auto recovery-plan 192.168.100.10:5555
+
+# run autonomous device recovery phase 1 (safe reconnect flow)
+zeropoint-control auto recovery-run 192.168.100.10:5555 --scope-id AUTH-DR-001 --authorized
+```
+
 ## Notes
 
 - `pyproject.toml` expects this file as the project README.

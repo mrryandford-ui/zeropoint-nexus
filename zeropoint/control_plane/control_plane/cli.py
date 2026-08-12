@@ -327,6 +327,123 @@ def ai_task(ctx: click.Context, task_type: str, payload_json: str):
 
 
 ###############################################################################
+# auto subgroup (phase 1 autonomous workflows)
+###############################################################################
+
+@main.group("auto")
+def auto_cmd():
+    """Autonomous workflow helpers (authorized use only)."""
+
+
+@auto_cmd.command("pentest-plan")
+@click.argument("target")
+@click.option("--allow-public", is_flag=True, default=False,
+              help="Allow public scopes (requires explicit authorization).")
+def auto_pentest_plan(target: str, allow_public: bool):
+    """Build a phase-1 autonomous pentest plan for TARGET."""
+    from zeropoint.control_plane.autonomous_mode import AutonomousWorkflowManager
+
+    mgr = AutonomousWorkflowManager()
+    try:
+        plan = mgr.plan_pentest(target, allow_public=allow_public)
+    except Exception as exc:
+        click.echo(f"Plan error: {exc}", err=True)
+        sys.exit(1)
+    _json(plan)
+
+
+@auto_cmd.command("pentest-run")
+@click.argument("target")
+@click.option("--scope-id", required=True, help="Authorization scope/ticket ID.")
+@click.option("--authorized", is_flag=True, default=False,
+              help="Explicitly confirm you are authorized to test this target scope.")
+@click.option("--active", is_flag=True, default=False,
+              help="Include active recon modules.")
+@click.option("--use-kali", is_flag=True, default=False,
+              help="Run Kali nmap quick scan in addition to OSINT.")
+@click.option("--allow-public", is_flag=True, default=False,
+              help="Allow public scopes (blocked by default).")
+def auto_pentest_run(
+    target: str,
+    scope_id: str,
+    authorized: bool,
+    active: bool,
+    use_kali: bool,
+    allow_public: bool,
+):
+    """Execute phase-1 autonomous pentest workflow."""
+    from zeropoint.control_plane.autonomous_mode import AutonomousWorkflowManager
+
+    mgr = AutonomousWorkflowManager()
+
+    async def _go():
+        return await mgr.run_pentest(
+            target=target,
+            scope_id=scope_id,
+            authorized=authorized,
+            active=active,
+            use_kali=use_kali,
+            allow_public=allow_public,
+        )
+
+    try:
+        result = _run(_go())
+    except Exception as exc:
+        click.echo(f"Autonomous pentest run failed: {exc}", err=True)
+        sys.exit(1)
+    _json(result)
+
+
+@auto_cmd.command("recovery-plan")
+@click.argument("device_serial")
+def auto_recovery_plan(device_serial: str):
+    """Build a phase-1 autonomous device recovery plan."""
+    from zeropoint.control_plane.autonomous_mode import AutonomousWorkflowManager
+
+    mgr = AutonomousWorkflowManager()
+    try:
+        plan = mgr.plan_device_recovery(device_serial)
+    except Exception as exc:
+        click.echo(f"Plan error: {exc}", err=True)
+        sys.exit(1)
+    _json(plan)
+
+
+@auto_cmd.command("recovery-run")
+@click.argument("device_serial")
+@click.option("--scope-id", required=True, help="Authorization scope/ticket ID.")
+@click.option("--authorized", is_flag=True, default=False,
+              help="Explicitly confirm you are authorized to operate on this device.")
+@click.option("--attempt-reconnect/--no-attempt-reconnect", default=True,
+              help="Run safe ADB reconnect workflow.")
+def auto_recovery_run(
+    device_serial: str,
+    scope_id: str,
+    authorized: bool,
+    attempt_reconnect: bool,
+):
+    """Execute phase-1 autonomous device recovery workflow."""
+    from zeropoint.control_plane.autonomous_mode import AutonomousWorkflowManager
+
+    mgr = AutonomousWorkflowManager()
+
+    async def _go():
+        return await mgr.run_device_recovery(
+            device_serial=device_serial,
+            authorized=authorized,
+            scope_id=scope_id,
+            attempt_reconnect=attempt_reconnect,
+        )
+
+    try:
+        result = _run(_go())
+    except Exception as exc:
+        click.echo(f"Autonomous recovery run failed: {exc}", err=True)
+        sys.exit(1)
+    _json(result)
+
+
+###############################################################################
 # ray subgroup
 ###############################################################################
 

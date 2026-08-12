@@ -127,3 +127,12 @@ Completed on ZERO-DEV:
 Remaining to close Phase A:
 - On ZERO-FLD, pull latest `main` and restart head services with Ray Client port open (`10001`).
 - Re-run ZERO-DEV validation and confirm task output no longer shows local fallback for healthy Ray path.
+
+Phase C early progress:
+- Added phase-1 autonomous workflow manager in [autonomous_mode.py](C:/Users/zeroi/Downloads/zeropoint-mcp/zeropoint/control_plane/autonomous_mode.py).
+- Added CLI entrypoints for plan/run flows:
+  - `zeropoint-control auto pentest-plan`
+  - `zeropoint-control auto pentest-run`
+  - `zeropoint-control auto recovery-plan`
+  - `zeropoint-control auto recovery-run`
+- Added unit coverage in [test_autonomous_mode.py](C:/Users/zeroi/Downloads/zeropoint-mcp/tests/unit/test_autonomous_mode.py).
