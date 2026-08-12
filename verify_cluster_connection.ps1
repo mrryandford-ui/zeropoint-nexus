@@ -156,16 +156,28 @@ if ($Connect) {
     
     # Initialize Ray connection
     INF "Connecting to Ray cluster..."
+
+    $rayImportCheck = & $PythonPath -c "import ray; print('RAY_OK')" 2>&1
+    if ($rayImportCheck -notlike "*RAY_OK*") {
+        WRN "Local Ray client is not usable in this Python environment."
+        WRN "Falling back to network-verified mode (head is reachable, RAY_ADDRESS is set)."
+        Write-Host ""
+        Write-Host "Details:" -ForegroundColor Yellow
+        ($rayImportCheck -split "`n") | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+        Write-Host ""
+        Write-Host "To enable full Ray client attach on this node, recreate the venv with Python 3.11 and reinstall deps." -ForegroundColor Yellow
+        exit 0
+    }
     
     $rayTest = & $PythonPath -c @"
 import ray
 try:
-    ray.init(address='$HeadNodeIP`:$RayPort', ignore_reinit_error=True)
+    ray.init(address='${HeadNodeIP}:$RayPort', ignore_reinit_error=True)
     print('CONNECTED')
     nodes = ray.nodes()
     print(f'NODES:{len(nodes)}')
     for node in nodes:
-        print(f'  - Node: {node[\"NodeID\"][:8]}... (Alive: {node[\"Alive\"]})')
+        print(f"  - Node: {node['NodeID'][:8]}... (Alive: {node['Alive']})")
     resources = ray.cluster_resources()
     print(f'RESOURCES:{resources}')
 except Exception as e:
