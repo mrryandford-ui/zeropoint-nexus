@@ -12,9 +12,11 @@ Routes AI workloads across the Ray cluster:
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -269,6 +271,127 @@ class AIOrchestrator:
         handler = handlers.get(task.task_type, self._handle_unknown)
         return await handler(task.payload)
 
+    def _ollama_base_url(self, payload: dict[str, Any]) -> str:
+        raw = (
+            payload.get("ollama_url")
+            or os.environ.get("ZP_OLLAMA_URL")
+            or os.environ.get("OLLAMA_HOST")
+            or "http://127.0.0.1:11434"
+        )
+        if "://" not in raw:
+            raw = f"http://{raw}"
+        return raw.rstrip("/")
+
+    def _ollama_model_for(self, task_type: str, payload: dict[str, Any]) -> str:
+        if task_type == "translate_text":
+            return (
+                payload.get("model")
+                or os.environ.get("ZP_OLLAMA_TEXT_MODEL")
+                or "qwen2.5:3b"
+            )
+        if task_type == "embed_text":
+            return (
+                payload.get("model")
+                or os.environ.get("ZP_OLLAMA_EMBED_MODEL")
+                or "nomic-embed-text"
+            )
+        if task_type == "analyze_image":
+            return (
+                payload.get("model")
+                or os.environ.get("ZP_OLLAMA_VISION_MODEL")
+                or "llava:7b"
+            )
+        return payload.get("model") or os.environ.get("ZP_OLLAMA_TEXT_MODEL") or "qwen2.5:3b"
+
+    async def _ollama_generate(
+        self,
+        payload: dict[str, Any],
+        prompt: str,
+        task_type: str,
+        images: list[str] | None = None,
+    ) -> dict[str, Any]:
+        import requests
+
+        base_url = self._ollama_base_url(payload)
+        model = self._ollama_model_for(task_type, payload)
+        timeout = float(payload.get("timeout_sec", 120))
+
+        body: dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+        }
+        if images:
+            body["images"] = images
+        if "temperature" in payload:
+            body["options"] = {"temperature": payload["temperature"]}
+
+        response = await asyncio.to_thread(
+            requests.post,
+            f"{base_url}/api/generate",
+            json=body,
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Ollama generate failed ({response.status_code}): {response.text[:500]}"
+            )
+        data = response.json()
+        return {
+            "text": data.get("response", "").strip(),
+            "model": data.get("model", model),
+            "backend": "ollama",
+            "ollama_url": base_url,
+        }
+
+    async def _ollama_embed(self, payload: dict[str, Any], text: str) -> dict[str, Any]:
+        import requests
+
+        base_url = self._ollama_base_url(payload)
+        model = self._ollama_model_for("embed_text", payload)
+        timeout = float(payload.get("timeout_sec", 120))
+
+        # Prefer newer /api/embed, fall back to /api/embeddings for compatibility.
+        embed_resp = await asyncio.to_thread(
+            requests.post,
+            f"{base_url}/api/embed",
+            json={"model": model, "input": [text]},
+            timeout=timeout,
+        )
+        if embed_resp.status_code == 200:
+            embed_json = embed_resp.json()
+            vectors = embed_json.get("embeddings") or []
+            if vectors:
+                return {
+                    "embedding": vectors[0],
+                    "dimensions": len(vectors[0]),
+                    "model": model,
+                    "backend": "ollama",
+                    "ollama_url": base_url,
+                }
+
+        legacy_resp = await asyncio.to_thread(
+            requests.post,
+            f"{base_url}/api/embeddings",
+            json={"model": model, "prompt": text},
+            timeout=timeout,
+        )
+        if legacy_resp.status_code != 200:
+            raise RuntimeError(
+                f"Ollama embeddings failed ({legacy_resp.status_code}): {legacy_resp.text[:500]}"
+            )
+        legacy_json = legacy_resp.json()
+        vector = legacy_json.get("embedding")
+        if not vector:
+            raise RuntimeError("Ollama embeddings response missing embedding vector")
+        return {
+            "embedding": vector,
+            "dimensions": len(vector),
+            "model": model,
+            "backend": "ollama",
+            "ollama_url": base_url,
+        }
+
     async def _handle_classify_it(self, payload: dict) -> dict:
         description = payload.get("description", "")
         keywords = {
@@ -325,17 +448,41 @@ class AIOrchestrator:
         }
 
     async def _handle_analyze_image(self, payload: dict) -> dict:
-        """
-        Placeholder for CamNet image analysis.
-        In production, swap the body for a call to a vision model
-        (e.g. LLaVA via llama.cpp, or a cloud vision API).
-        """
         image_path = payload.get("image_path", "")
-        return {
-            "image_path": image_path,
-            "analysis": "Vision model not configured — plug in LLaVA or cloud vision API.",
-            "status": "stub",
-        }
+        if not image_path:
+            return {"status": "error", "error": "image_path is required"}
+        if not os.path.exists(image_path):
+            return {"status": "error", "error": f"image_path not found: {image_path}"}
+
+        try:
+            with open(image_path, "rb") as f:
+                image_b64 = base64.b64encode(f.read()).decode("ascii")
+
+            prompt = payload.get(
+                "prompt",
+                "Analyze this image and return key findings, anomalies, and confidence.",
+            )
+            result = await self._ollama_generate(
+                payload=payload,
+                prompt=prompt,
+                task_type="analyze_image",
+                images=[image_b64],
+            )
+            return {
+                "status": "ok",
+                "image_path": image_path,
+                "analysis": result["text"],
+                "model": result["model"],
+                "backend": result["backend"],
+                "ollama_url": result["ollama_url"],
+            }
+        except Exception as exc:
+            return {
+                "status": "stub",
+                "image_path": image_path,
+                "analysis": "Vision backend unavailable — using placeholder output.",
+                "backend_error": str(exc),
+            }
 
     async def _handle_generate_report(self, payload: dict) -> dict:
         data = payload.get("data", {})
@@ -395,25 +542,67 @@ class AIOrchestrator:
         }
 
     async def _handle_translate(self, payload: dict) -> dict:
-        return {
-            "note": "Translation model not configured — integrate with local or cloud NMT.",
-            "source_text": payload.get("text", "")[:100],
-            "target_language": payload.get("target_language", "en"),
-            "status": "stub",
-        }
+        source_text = payload.get("text", "")
+        target_language = payload.get("target_language", "en")
+        if not source_text:
+            return {"status": "error", "error": "text is required"}
+
+        prompt = (
+            f"Translate the following text into {target_language}. "
+            "Return only the translated text.\n\n"
+            f"{source_text}"
+        )
+        try:
+            result = await self._ollama_generate(
+                payload=payload,
+                prompt=prompt,
+                task_type="translate_text",
+            )
+            return {
+                "status": "ok",
+                "translated_text": result["text"],
+                "source_text": source_text[:200],
+                "target_language": target_language,
+                "model": result["model"],
+                "backend": result["backend"],
+                "ollama_url": result["ollama_url"],
+            }
+        except Exception as exc:
+            return {
+                "status": "stub",
+                "note": "Translation backend unavailable — configure/start Ollama on this node.",
+                "source_text": source_text[:100],
+                "target_language": target_language,
+                "backend_error": str(exc),
+            }
 
     async def _handle_embed(self, payload: dict) -> dict:
         text = payload.get("text", "")
-        # Deterministic stub — replace with sentence-transformers in production
-        h = int(hashlib.sha256(text.encode()).hexdigest(), 16)
-        vec = [(((h >> i) & 0xFF) / 255.0 - 0.5) for i in range(0, 384 * 8, 8)]
-        return {
-            "embedding": vec[:384],
-            "dimensions": 384,
-            "model": "stub_sha256_384d",
-            "note": "Replace with sentence-transformers or text-embedding-ada-002 in production.",
-        }
+        if not text:
+            return {"status": "error", "error": "text is required"}
+
+        try:
+            result = await self._ollama_embed(payload=payload, text=text)
+            return {
+                "status": "ok",
+                "embedding": result["embedding"],
+                "dimensions": result["dimensions"],
+                "model": result["model"],
+                "backend": result["backend"],
+                "ollama_url": result["ollama_url"],
+            }
+        except Exception as exc:
+            # Deterministic fallback preserves previous behavior when no backend is available.
+            h = int(hashlib.sha256(text.encode()).hexdigest(), 16)
+            vec = [(((h >> i) & 0xFF) / 255.0 - 0.5) for i in range(0, 384 * 8, 8)]
+            return {
+                "status": "stub",
+                "embedding": vec[:384],
+                "dimensions": 384,
+                "model": "stub_sha256_384d",
+                "backend_error": str(exc),
+                "note": "Using deterministic fallback embedding because Ollama was unavailable.",
+            }
 
     async def _handle_unknown(self, payload: dict) -> dict:
         return {"error": "No handler for this task type.", "payload_keys": list(payload.keys())}
-

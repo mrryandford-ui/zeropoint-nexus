@@ -11,6 +11,7 @@ param(
 
 $HeadNodeIP = "192.168.0.140"
 $RayPort = 6379
+$RayClientPort = 10001
 $McpPort = 8765
 $IdentityPort = 8766
 $PythonPath = "C:\Users\zeroi\Downloads\zeropoint-mcp\.venv\Scripts\python.exe"
@@ -172,7 +173,11 @@ if ($Connect) {
     $rayTest = & $PythonPath -c @"
 import ray
 try:
-    ray.init(address='${HeadNodeIP}:$RayPort', ignore_reinit_error=True)
+    # Prefer Ray Client when available on the head node.
+    try:
+        ray.init(address='ray://${HeadNodeIP}:$RayClientPort', ignore_reinit_error=True)
+    except Exception:
+        ray.init(address='${HeadNodeIP}:$RayPort', ignore_reinit_error=True)
     print('CONNECTED')
     nodes = ray.nodes()
     print(f'NODES:{len(nodes)}')
