@@ -8,7 +8,11 @@ param(
         "generate_report",
         "translate_text",
         "embed_text",
-        "analyze_image"
+        "analyze_image",
+        "auto_pentest_plan",
+        "auto_pentest_run",
+        "auto_recovery_plan",
+        "auto_recovery_run"
     )]
     [string]$TaskType,
 

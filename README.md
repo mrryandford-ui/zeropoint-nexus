@@ -69,9 +69,51 @@ cd C:\Users\zeroi\Downloads\zeropoint-mcp
 .\verify_cluster_connection.ps1 -Connect
 ```
 
-## Autonomous workflows (Phase 1)
+## Phase B: Operator UX Simplification (Unified Runner)
 
-These are scope-gated helpers for authorized operations:
+**👉 START HERE FOR DAILY USE**
+
+The new **operator.ps1** provides a single, copy/paste-only interface for all workflows:
+
+```powershell
+cd C:\Users\zeroi\Downloads\zeropoint-mcp
+
+# Verify cluster is healthy
+.\operator.ps1 -Mode verify
+
+# Run autonomous pentest (Phase 1: Recon)
+.\operator.ps1 -Mode pentest -TargetRange "192.168.0.0/24" -Scope "authorized-assessment-001" -PentestPhase phase1-recon
+
+# Run autonomous pentest (Phase 1 + 2: Full Pipeline, with Metasploit)
+.\operator.ps1 -Mode pentest `
+  -TargetRange "192.168.0.0/24" `
+  -Scope "authorized-assessment-001" `
+  -PentestPhase phase1-2-full `
+  -UseMetasploit `
+  -ActorRole "security-lead"
+
+# Run device recovery (Android)
+.\operator.ps1 -Mode recovery -DeviceName "OnePlus-Test" -Scope "recovery-ticket-042"
+
+# List available presets
+.\operator.ps1 -Mode list-presets
+```
+
+**For complete copy/paste workflows and troubleshooting, see [OPERATOR_RUNBOOK.md](OPERATOR_RUNBOOK.md)**
+
+### Key features:
+
+- ✅ **No manual JSON.** Built-in task presets for all workflows.
+- ✅ **Copy/paste only.** Every command is ready to copy from runbook.
+- ✅ **Role-gated.** Specify `-ActorRole` to control access to restricted tools (Metasploit, Hashcat, John).
+- ✅ **Audit trail.** All submissions logged with scope ID, actor, and timestamp.
+- ✅ **Auto-retry.** Execution mode auto-detects Ray Client/Direct/Local.
+
+---
+
+## Autonomous workflows (Phase 1) - Direct CLI
+
+For advanced users who prefer direct CLI access:
 
 ```powershell
 # build an autonomous pentest plan
