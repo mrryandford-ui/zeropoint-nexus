@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -297,13 +298,19 @@ def ai():
 @click.argument("task_type", type=click.Choice([
     "classify_it_issue", "summarize_osint", "extract_iocs",
     "triage_alert", "generate_report",
+    "translate_text", "embed_text", "analyze_image",
 ]))
 @click.argument("payload_json")
 @click.pass_context
 def ai_task(ctx: click.Context, task_type: str, payload_json: str):
     """Submit an AI task. PAYLOAD_JSON is a JSON string."""
     from zeropoint.control_plane.ai_orchestrator import AIOrchestrator
-    orch = AIOrchestrator()
+    orch = AIOrchestrator(
+        ray_config={
+            "head_node": os.environ.get("RAY_ADDRESS", "auto"),
+            "namespace": "zeropoint",
+        }
+    )
 
     try:
         payload = json.loads(payload_json)

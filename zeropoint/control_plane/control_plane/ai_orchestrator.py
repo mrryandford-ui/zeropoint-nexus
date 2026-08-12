@@ -182,7 +182,18 @@ class AIOrchestrator:
         try:
             async with self._semaphore:
                 if self._ray_available:
-                    result = await self._execute_ray(task)
+                    try:
+                        result = await self._execute_ray(task)
+                    except Exception as exc:
+                        logger.warning(
+                            "Ray execution failed for %s (%s); falling back to local execution.",
+                            task.task_id,
+                            exc,
+                        )
+                        result = await self._execute_local(task)
+                        if isinstance(result, dict):
+                            result.setdefault("_execution_mode", "local_fallback")
+                            result.setdefault("_ray_error", str(exc))
                 else:
                     result = await self._execute_local(task)
         except Exception as exc:
