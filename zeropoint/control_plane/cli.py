@@ -19,7 +19,7 @@ DEFAULT_CONFIG = "/workspace/zeropoint/config/mcp_server_config.yaml"
 
 def _cp(config: str):
     """Lazy-load control plane to avoid slow imports on --help."""
-    from zeropoint.control_plane.control_plane import ZeroPointControlPlane
+    from zeropoint.control_plane.control_plane.control_plane import ZeroPointControlPlane
     cfg = yaml.safe_load(Path(config).read_text())
     cfg["_config_path"] = config
     return ZeroPointControlPlane(cfg)

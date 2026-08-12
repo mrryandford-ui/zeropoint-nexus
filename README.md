@@ -35,6 +35,7 @@ The cluster is intended to:
 
 ## Important files
 
+- [PROJECT_SCOPE_HANDOFF.md](PROJECT_SCOPE_HANDOFF.md)
 - [PROJECT_STATUS.txt](PROJECT_STATUS.txt)
 - [SYSTEM_OVERVIEW.md](SYSTEM_OVERVIEW.md)
 - [CLUSTER_STATUS.md](CLUSTER_STATUS.md)
@@ -71,5 +72,6 @@ cd C:\Users\zeroi\Downloads\zeropoint-mcp
 ## Notes
 
 - `pyproject.toml` expects this file as the project README.
+- [PROJECT_SCOPE_HANDOFF.md](PROJECT_SCOPE_HANDOFF.md) is the current canonical scope/handoff plan.
 - Settings Sync should be enabled in VS Code on both machines.
 - The backend should remain the cluster head; the workstation should remain the interactive front end.

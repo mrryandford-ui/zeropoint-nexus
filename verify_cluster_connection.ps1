@@ -149,11 +149,26 @@ if ($Connect) {
     OK "ZERO-FLD is reachable ✓"
     Write-Host ""
     
+    # Determine preferred Ray connection mode.
+    $rayClientReachable = $false
+    try {
+        $rayClientCheck = Test-NetConnection -ComputerName $HeadNodeIP -Port $RayClientPort -WarningAction SilentlyContinue
+        $rayClientReachable = [bool]$rayClientCheck.TcpTestSucceeded
+    } catch {
+        $rayClientReachable = $false
+    }
+
     # Set Ray address
     INF "Setting Ray cluster address..."
-    $env:RAY_ADDRESS = "$HeadNodeIP`:$RayPort"
-    OK "RAY_ADDRESS set to: $env:RAY_ADDRESS"
+    if ($rayClientReachable) {
+        $env:RAY_ADDRESS = "ray://$HeadNodeIP`:$RayClientPort"
+        OK "RAY_ADDRESS set to Ray Client: $env:RAY_ADDRESS"
+    } else {
+        $env:RAY_ADDRESS = "$HeadNodeIP`:$RayPort"
+        WRN "Ray Client port $RayClientPort is not reachable; using direct address: $env:RAY_ADDRESS"
+    }
     Write-Host ""
+    $pythonRayAddress = $env:RAY_ADDRESS
     
     # Initialize Ray connection
     INF "Connecting to Ray cluster..."
@@ -173,11 +188,7 @@ if ($Connect) {
     $rayTest = & $PythonPath -c @"
 import ray
 try:
-    # Prefer Ray Client when available on the head node.
-    try:
-        ray.init(address='ray://${HeadNodeIP}:$RayClientPort', ignore_reinit_error=True)
-    except Exception:
-        ray.init(address='${HeadNodeIP}:$RayPort', ignore_reinit_error=True)
+    ray.init(address='${pythonRayAddress}', ignore_reinit_error=True)
     print('CONNECTED')
     nodes = ray.nodes()
     print(f'NODES:{len(nodes)}')
@@ -219,6 +230,11 @@ except Exception as e:
         Write-Host ""
         Write-Host "Error details:" -ForegroundColor Yellow
         $rayTest | ForEach-Object { if ($_ -like "*ERROR:*") { Write-Host "  $_" -ForegroundColor Red } }
+        if (-not $rayClientReachable) {
+            Write-Host ""
+            WRN "Ray Client port $RayClientPort on ZERO-FLD is not reachable."
+            WRN "On ZERO-FLD, restart head with Ray Client enabled and verify port $RayClientPort is listening."
+        }
         exit 1
     }
     
