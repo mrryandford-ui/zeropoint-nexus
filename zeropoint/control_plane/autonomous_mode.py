@@ -358,6 +358,15 @@ class AutonomousWorkflowManager:
                     "ok" if msf_result.success else "failed",
                     returncode=msf_result.returncode,
                 )
+                
+                # Normalize metasploit findings
+                if msf_result.success and msf_result.stdout:
+                    from zeropoint.pentest.recon_orchestrator import MetasploitAdapter
+                    adapter = MetasploitAdapter()
+                    msf_findings = adapter.parse_output(msf_result.stdout, target)
+                    orchestrator.all_findings.extend(msf_findings)
+                    self._log("finding_normalization", "metasploit", "ok", finding_count=len(msf_findings))
+
 
             if (use_hashcat or use_john) and not hash_file:
                 self._log("credential", "hash_input", "failed", reason="hash_file_missing")
@@ -384,6 +393,15 @@ class AutonomousWorkflowManager:
                     "ok" if hashcat_result.success else "failed",
                     returncode=hashcat_result.returncode,
                 )
+                
+                # Normalize hashcat findings
+                if hashcat_result.success and hashcat_result.stdout:
+                    from zeropoint.pentest.recon_orchestrator import HashcatAdapter
+                    adapter = HashcatAdapter()
+                    hashcat_findings = adapter.parse_output(hashcat_result.stdout, target)
+                    orchestrator.all_findings.extend(hashcat_findings)
+                    self._log("finding_normalization", "hashcat", "ok", finding_count=len(hashcat_findings))
+
 
             if use_john:
                 self._log("credential", "john", "started")
@@ -405,6 +423,15 @@ class AutonomousWorkflowManager:
                     "ok" if john_result.success else "failed",
                     returncode=john_result.returncode,
                 )
+                
+                # Normalize john findings
+                if john_result.success and john_result.stdout:
+                    from zeropoint.pentest.recon_orchestrator import JohnAdapter
+                    adapter = JohnAdapter()
+                    john_findings = adapter.parse_output(john_result.stdout, target)
+                    orchestrator.all_findings.extend(john_findings)
+                    self._log("finding_normalization", "john", "ok", finding_count=len(john_findings))
+
 
         open_ports = []
         for item in osint_result.get("results", []):
