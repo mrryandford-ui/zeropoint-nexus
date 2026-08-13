@@ -10,8 +10,12 @@ from zeropoint.pentest.recon_orchestrator import (
     NmapAdapter,
     Enum4linuxAdapter,
     WhatwebAdapter,
+    MetasploitAdapter,
+    JohnAdapter,
+    HashcatAdapter,
     ReconOrchestrator,
 )
+
 
 
 class TestNormalizedFinding:
@@ -308,3 +312,151 @@ class TestReconOrchestrator:
         assert "CRITICAL" in content
         assert "HIGH" in content
         assert "192.168.1.1" in content
+
+
+class TestMetasploitAdapter:
+    """Tests for Metasploit output normalization."""
+
+    def test_parse_metasploit_module_search(self):
+        """Test parsing Metasploit module search results."""
+        from zeropoint.pentest.recon_orchestrator import MetasploitAdapter
+        
+        adapter = MetasploitAdapter()
+        json_output = """{
+            "modules": [
+                {
+                    "name": "ms17_010_eternalblue",
+                    "type": "exploit",
+                    "description": "Windows SMB RCE vulnerability",
+                    "target_type": "windows"
+                },
+                {
+                    "name": "ssh_password_auth",
+                    "type": "auxiliary",
+                    "description": "SSH password authentication scanner",
+                    "target_type": "ssh"
+                }
+            ]
+        }"""
+        findings = adapter.parse_json(json_output, "192.168.1.1")
+        assert len(findings) == 2
+        assert findings[0].title == "Metasploit Module: ms17_010_eternalblue"
+        assert findings[0].severity == Severity.HIGH
+        assert findings[0].type == FindingType.VULNERABLE_SERVICE
+
+    def test_parse_metasploit_sessions(self):
+        """Test parsing Metasploit exploitation results."""
+        from zeropoint.pentest.recon_orchestrator import MetasploitAdapter
+        
+        adapter = MetasploitAdapter()
+        json_output = """{
+            "sessions": [
+                {
+                    "session_id": 1,
+                    "type": "meterpreter",
+                    "info": "System shell opened"
+                }
+            ]
+        }"""
+        findings = adapter.parse_json(json_output, "192.168.1.1")
+        assert len(findings) == 1
+        assert findings[0].title == "Metasploit Session Established: meterpreter"
+        assert findings[0].severity == Severity.CRITICAL
+        assert findings[0].type == FindingType.PRIVILEGE_ESCALATION
+
+    def test_parse_metasploit_invalid_json(self):
+        """Test parsing invalid Metasploit JSON output."""
+        from zeropoint.pentest.recon_orchestrator import MetasploitAdapter
+        
+        adapter = MetasploitAdapter()
+        findings = adapter.parse_json("invalid json", "192.168.1.1")
+        assert len(findings) == 0
+
+
+class TestJohnAdapter:
+    """Tests for John the Ripper output normalization."""
+
+    def test_parse_john_cracked_passwords(self):
+        """Test parsing John 'show' output."""
+        from zeropoint.pentest.recon_orchestrator import JohnAdapter
+        
+        adapter = JohnAdapter()
+        output = """
+        root:password123:0:0:root:/root:/bin/bash
+        admin:admin@123:1000:1000:Admin User:/home/admin:/bin/bash
+        user:letmein:1001:1001:Regular User:/home/user:/bin/bash
+        """
+        findings = adapter.parse_output(output, "192.168.1.1")
+        assert len(findings) == 3
+        assert findings[0].type == FindingType.CREDENTIAL_WEAKNESS
+        assert findings[0].severity == Severity.HIGH
+        assert "root" in findings[0].title
+        assert "password123" not in findings[0].evidence
+        assert findings[0].source_tool == "john"
+
+    def test_parse_john_empty_output(self):
+        """Test parsing empty John output."""
+        from zeropoint.pentest.recon_orchestrator import JohnAdapter
+        
+        adapter = JohnAdapter()
+        findings = adapter.parse_output("", "192.168.1.1")
+        assert len(findings) == 0
+
+    def test_parse_john_with_comments(self):
+        """Test parsing John output with comment lines."""
+        from zeropoint.pentest.recon_orchestrator import JohnAdapter
+        
+        adapter = JohnAdapter()
+        output = """
+        # Cracked passwords
+        root:password123:0:0:root:/root:/bin/bash
+        # End of cracked
+        """
+        findings = adapter.parse_output(output, "192.168.1.1")
+        assert len(findings) == 1
+
+
+class TestHashcatAdapter:
+    """Tests for Hashcat output normalization."""
+
+    def test_parse_hashcat_cracked_hashes(self):
+        """Test parsing Hashcat output."""
+        from zeropoint.pentest.recon_orchestrator import HashcatAdapter
+        
+        adapter = HashcatAdapter()
+        output = """
+        5f4dcc3b5aa765d61d8327deb882cf99:password123
+        8846f7eaee8fb117ad06bdd830b7e7c7:admin@123
+        4d967a2a964860cb1ffc4eae12341d13:letmein
+        """
+        findings = adapter.parse_output(output, "192.168.1.1")
+        assert len(findings) == 3
+        assert findings[0].type == FindingType.CREDENTIAL_WEAKNESS
+        assert findings[0].severity == Severity.HIGH
+        assert "Hash Cracked with Hashcat" in findings[0].title
+        assert findings[0].source_tool == "hashcat"
+        # Verify hash is truncated in evidence
+        assert "5f4dcc3b5aa765d6..." in findings[0].evidence["hash_prefix"]
+
+    def test_parse_hashcat_empty_output(self):
+        """Test parsing empty Hashcat output."""
+        from zeropoint.pentest.recon_orchestrator import HashcatAdapter
+        
+        adapter = HashcatAdapter()
+        findings = adapter.parse_output("", "192.168.1.1")
+        assert len(findings) == 0
+
+    def test_parse_hashcat_with_comments(self):
+        """Test parsing Hashcat output with comments."""
+        from zeropoint.pentest.recon_orchestrator import HashcatAdapter
+        
+        adapter = HashcatAdapter()
+        output = """
+        # Cracked hashes
+        5f4dcc3b5aa765d61d8327deb882cf99:password123
+        # Recovery complete
+        """
+        findings = adapter.parse_output(output, "192.168.1.1")
+        assert len(findings) == 1
+        assert "5f4dcc3b5aa765d6..." in findings[0].evidence["hash_prefix"]
+
