@@ -32,6 +32,19 @@
       "write_allowed_roles": ["owner", "security_lead"]
     }
   },
+  "authorized_scope_ranges": {
+    "description": "CIDR ranges authorized for pentest and security operations. All in-scope targets must fall within one of these ranges.",
+    "pentest": [
+      "192.168.0.0/16",
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "127.0.0.0/8"
+    ],
+    "recovery": [
+      "127.0.0.0/8"
+    ],
+    "external_testing_enabled": false
+  },
   "cluster": "ZeroPoint-MCP",
   "nodes": {
     "ZERO-DEV": {

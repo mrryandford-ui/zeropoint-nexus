@@ -141,6 +141,7 @@ class AutonomousWorkflowManager:
     def __init__(self, governance_path: str | Path | None = None) -> None:
         self._events: list[AuditEvent] = []
         self._governance = _load_governance(governance_path)
+        self._authorized_ranges: dict[str, Any] = self._governance.get("authorized_scope_ranges", {})
 
     def _log(self, phase: str, action: str, status: str, **details: Any) -> None:
         self._events.append(AuditEvent(phase=phase, action=action, status=status, details=details))
@@ -161,12 +162,50 @@ class AutonomousWorkflowManager:
         }
         return defaults.get(workflow_key, {"owner"})
 
+    def _is_target_in_approved_scope(self, target: str, workflow_key: str = "pentest_phase1") -> bool:
+        """
+        Check if target (single IP or CIDR) falls within approved scope ranges for the workflow.
+        Returns True if target is within any approved range.
+        """
+        if not self._authorized_ranges:
+            return True  # No restrictions if not configured
+
+        workflow_ranges_key = "pentest" if workflow_key == "pentest_phase1" else "recovery"
+        approved_ranges = self._authorized_ranges.get(workflow_ranges_key, [])
+        
+        if not approved_ranges:
+            return True  # No restrictions if workflow not listed
+
+        target = (target or "").strip()
+        if not target:
+            return False
+
+        try:
+            # Try parsing target as IP or CIDR
+            target_net = ipaddress.ip_network(target, strict=False)
+        except ValueError:
+            # If it's a hostname, we can't check it against CIDR ranges
+            # Default to allowing hostnames (assumed to be private/approved)
+            return True
+
+        for range_str in approved_ranges:
+            try:
+                approved_net = ipaddress.ip_network(range_str, strict=False)
+                # Check if target_net is completely within approved_net
+                if target_net.subnet_of(approved_net):
+                    return True
+            except ValueError:
+                continue
+
+        return False
+
     def _require_authorized(
         self,
         authorized: bool,
         scope_id: str,
         actor_role: str,
         workflow_key: str,
+        target: str | None = None,
     ) -> None:
         if not authorized:
             raise AuthorizationError("authorized=True is required.")
@@ -180,6 +219,14 @@ class AutonomousWorkflowManager:
             raise AuthorizationError(
                 f"Role '{actor_role}' is not allowed for {workflow_key}. Allowed: {sorted(allowed)}"
             )
+        
+        # Check if target is within approved scope ranges
+        if target:
+            if not self._is_target_in_approved_scope(target, workflow_key):
+                raise ScopeValidationError(
+                    f"Target '{target}' is not within approved scope ranges for {workflow_key}. "
+                    "Contact security_lead for scope expansion."
+                )
 
     def plan_pentest(self, target: str, allow_public: bool = False) -> dict[str, Any]:
         scope = validate_target_scope(target, allow_public=allow_public)
@@ -221,7 +268,7 @@ class AutonomousWorkflowManager:
         export_findings: bool = True,
     ) -> dict[str, Any]:
         self._clear()
-        self._require_authorized(authorized, scope_id, actor_role, "pentest_phase1")
+        self._require_authorized(authorized, scope_id, actor_role, "pentest_phase1", target=target)
         scope = validate_target_scope(target, allow_public=allow_public)
         self._log(
             "scope",

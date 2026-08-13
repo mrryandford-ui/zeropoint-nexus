@@ -127,3 +127,73 @@ class TestAutonomousWorkflowManager:
         assert result["recommendation"] == "device_online"
         assert result["reconnect_session"]["success"] is True
 
+
+class TestScopeRangeValidation:
+    """Test approved scope range enforcement."""
+
+    def test_target_within_approved_range(self):
+        """Target within approved range should pass validation."""
+        mgr = AutonomousWorkflowManager()
+        # This should not raise an exception since governance has approved ranges
+        is_in_scope = mgr._is_target_in_approved_scope("192.168.1.10", "pentest_phase1")
+        assert is_in_scope is True
+
+    def test_target_within_approved_cidr_range(self):
+        """CIDR range within approved range should pass validation."""
+        mgr = AutonomousWorkflowManager()
+        is_in_scope = mgr._is_target_in_approved_scope("192.168.1.0/25", "pentest_phase1")
+        assert is_in_scope is True
+
+    def test_target_outside_approved_range(self):
+        """Target outside approved ranges should fail validation."""
+        mgr = AutonomousWorkflowManager()
+        is_in_scope = mgr._is_target_in_approved_scope("8.8.8.8", "pentest_phase1")
+        assert is_in_scope is False
+
+    def test_target_outside_approved_cidr_range(self):
+        """CIDR range outside approved ranges should fail validation."""
+        mgr = AutonomousWorkflowManager()
+        is_in_scope = mgr._is_target_in_approved_scope("8.0.0.0/8", "pentest_phase1")
+        assert is_in_scope is False
+
+    def test_hostname_allowed_by_default(self):
+        """Hostnames should be allowed since we can't validate CIDR against DNS names."""
+        mgr = AutonomousWorkflowManager()
+        is_in_scope = mgr._is_target_in_approved_scope("internal.example.com", "pentest_phase1")
+        assert is_in_scope is True
+
+    def test_recovery_workflow_range_validation(self):
+        """Recovery workflow should use recovery scope ranges."""
+        mgr = AutonomousWorkflowManager()
+        # 127.0.0.0/8 is in recovery approved ranges
+        is_in_scope = mgr._is_target_in_approved_scope("127.0.0.1", "recovery_phase1")
+        assert is_in_scope is True
+        # 192.168.0.0/16 is NOT in recovery approved ranges (only pentest)
+        is_in_scope = mgr._is_target_in_approved_scope("192.168.1.10", "recovery_phase1")
+        assert is_in_scope is False
+
+    @pytest.mark.asyncio
+    async def test_authorization_checks_scope_range(self):
+        """Authorization should reject out-of-scope targets."""
+        mgr = AutonomousWorkflowManager()
+        with pytest.raises(ScopeValidationError, match="not within approved scope ranges"):
+            mgr._require_authorized(
+                authorized=True,
+                scope_id="AUTH-001",
+                actor_role="security_analyst",
+                workflow_key="pentest_phase1",
+                target="8.8.8.8",
+            )
+
+    @pytest.mark.asyncio
+    async def test_authorization_allows_in_scope_targets(self):
+        """Authorization should accept in-scope targets."""
+        mgr = AutonomousWorkflowManager()
+        # This should not raise an exception
+        mgr._require_authorized(
+            authorized=True,
+            scope_id="AUTH-001",
+            actor_role="security_analyst",
+            workflow_key="pentest_phase1",
+            target="192.168.1.10",
+        )
