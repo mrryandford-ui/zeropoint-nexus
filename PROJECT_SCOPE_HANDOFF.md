@@ -1,6 +1,6 @@
 # ZeroPoint MCP Project Scope & Handoff
 
-Last updated: 2026-08-12 (Phase C orchestrator integration complete)
+Last updated: 2026-08-20 (local MCP stabilization and VS Code stdio integration)
 
 ## 1) Mission
 
@@ -15,15 +15,17 @@ Build a **local-first, two-node AI operations platform** that can:
 ## 2) Current Reality (Authoritative)
 
 ### Working now
-- Two-node topology exists and is reachable.
-- Ray head and Ray Client ports are available on ZERO-FLD.
-- AI task submission scripts work from ZERO-DEV.
-- Ollama-backed task types (translate/embed/analyze_image) execute successfully.
-- Worker/bootstrap automation scripts are present.
+- ZERO-DEV operates as a local-first installation from `C:\Zeropoint`.
+- The local ZeroPoint MCP server exposes six tools: filesystem read/write/list and web fetch/search/scrape.
+- VS Code can launch ZeroPoint through the tested local stdio MCP transport without OAuth.
+- The scheduled local health check runs hidden every 15 minutes and its latest result is successful.
+- AI task submission scripts, Ollama-backed task types, and worker/bootstrap automation scripts are present.
 
 ### Not fully complete yet
-- Distributed execution can still fall back locally due import/cycle issues in control-plane package layout.
-- Documentation across older markdown files is inconsistent with current runtime state.
+- ZERO-FLD/Ray remote execution is optional and has not been revalidated in the current local-first configuration.
+- Failure-only health notifications are not implemented yet.
+- The local HTTP/WebSocket MCP endpoint is not a VS Code-compatible HTTP transport; VS Code uses stdio instead.
+- Documentation across older markdown files is inconsistent with the relocated `C:\Zeropoint` runtime state.
 - Autonomous "give target and run end-to-end" mode is not implemented yet.
 
 ### Operating Decision
@@ -31,6 +33,13 @@ Build a **local-first, two-node AI operations platform** that can:
 - ZERO-DEV must remain fully usable as a single-machine local-first installation.
 - ZERO-FLD is optional capacity for heavier or distributed workloads, not a prerequisite for normal operation.
 - When ZERO-FLD is unavailable, the system should continue locally where supported and clearly report when a requested task requires remote capacity.
+
+### Latest Stabilization Checkpoint
+
+- Commit `4ece177` was pushed to `origin/main` for local MCP startup stabilization and VS Code stdio transport.
+- The current workspace MCP configuration contains only the local `zeropoint` stdio server.
+- Optional third-party servers such as Netdata, Hugging Face, and Desktop Commander are not required by ZeroPoint and should remain disabled unless explicitly needed.
+- MCP registry and integration validation passed: 22 tests passed.
 
 ## 3) Target End State
 
