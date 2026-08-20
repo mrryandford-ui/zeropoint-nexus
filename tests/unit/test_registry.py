@@ -54,6 +54,15 @@ def _make_config(tmp_path: Path, tools_enabled=("filesystem",)) -> Path:
                 "input_schema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}},
                 "output_schema": {},
                 "tags": ["filesystem"],
+            },
+            {
+                "name": "filesystem_list",
+                "module": "filesystem",
+                "class": "FilesystemTool",
+                "description": "List a directory.",
+                "input_schema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}},
+                "output_schema": {},
+                "tags": ["filesystem"],
             }
         ]
     }
@@ -137,11 +146,19 @@ class TestCall:
         reg = ToolRegistry(cfg_path)
         reg.load()
 
-        # Inject _op so dispatch works
         result = await reg.call("filesystem_read", {
-            "_op": "read",
             "path": str(tmp_path / "hello.txt"),
         })
+        assert not result.get("isError")
+
+    @pytest.mark.asyncio
+    async def test_call_derives_operation_from_tool_name(self, tmp_path):
+        cfg_path = _make_config(tmp_path)
+        reg = ToolRegistry(cfg_path)
+        reg.load()
+
+        result = await reg.call("filesystem_list", {"path": str(tmp_path)})
+
         assert not result.get("isError")
 
 

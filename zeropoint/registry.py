@@ -164,7 +164,11 @@ class ToolRegistry:
                 f"Available: {sorted(self._tools.keys())}",
                 code="UNKNOWN_TOOL",
             ).to_mcp()
-        return await tool.safe_execute(params)
+        _, separator, operation = tool_name.partition("_")
+        tool_params = dict(params)
+        if separator and operation:
+            tool_params["_op"] = operation
+        return await tool.safe_execute(tool_params)
 
     # ------------------------------------------------------------------
     # Introspection
