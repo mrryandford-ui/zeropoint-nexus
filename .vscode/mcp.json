@@ -13,15 +13,7 @@
   // VS Code settings required (settings.json):
   //   "github.copilot.chat.agent.mcpServers": true
 
-  // NOTE: All ZeroPoint server entries were removed (not just disabled).
-  // The ZeroPoint MCP server currently only exposes a WebSocket endpoint at
-  // /mcp, which VS Code's MCP client cannot speak (it expects Streamable
-  // HTTP or stdio). Leaving an "http" entry here, even with "enabled": false,
-  // still caused VS Code to attempt a connection and trigger OAuth dynamic
-  // client registration prompts. See:
-  //   tasks/pending/vscode-mcp-transport-integration.md
-  // Re-add a server entry here only after a stdio or Streamable HTTP adapter
-  // has been implemented and tested against a real MCP handshake.
+  // ZeroPoint uses stdio because the HTTP endpoint is WebSocket-only.
   "servers": {
     "zeropoint": {
       "type": "stdio",
