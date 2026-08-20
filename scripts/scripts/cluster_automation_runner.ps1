@@ -17,12 +17,60 @@ $rayExe = Join-Path $root ".venv\Scripts\ray.exe"
 
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 $logFile = Join-Path $logDir ("cluster-automation-{0}.log" -f (Get-Date -Format "yyyyMMdd"))
+$healthStateFile = Join-Path $logDir "health-notification-state.json"
+$healthAlertFile = Join-Path $logDir "health-alert.json"
 
 function Write-Log {
     param([string]$Message)
     $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $env:COMPUTERNAME, $Message
     Add-Content -Path $logFile -Value $line
     Write-Host $line
+}
+
+function Update-HealthNotification {
+    param([bool]$Healthy)
+
+    $previous = $null
+    if (Test-Path $healthStateFile) {
+        try {
+            $previous = Get-Content -Raw -Path $healthStateFile | ConvertFrom-Json
+        } catch {
+            Write-Log "Could not read previous health notification state."
+        }
+    }
+
+    $status = if ($Healthy) { "healthy" } else { "unhealthy" }
+    $previousStatus = if ($previous) { $previous.status } else { $null }
+    $failureCount = if ($Healthy) { 0 } elseif ($previous -and $previous.status -eq "unhealthy") { [int]$previous.failureCount + 1 } else { 1 }
+    $state = [pscustomobject]@{
+        status = $status
+        failureCount = $failureCount
+        updatedAt = (Get-Date).ToUniversalTime().ToString("o")
+    }
+    $state | ConvertTo-Json | Set-Content -Path $healthStateFile -Encoding UTF8
+
+    if ($status -eq $previousStatus -or ($Healthy -and -not $previous)) {
+        return
+    }
+
+    $message = if ($Healthy) {
+        "ZeroPoint MCP recovered and is responding on port 8765."
+    } else {
+        "ZeroPoint MCP is unavailable on port 8765 after restart attempt."
+    }
+    $alert = [pscustomobject]@{
+        status = $status
+        message = $message
+        timestamp = (Get-Date).ToUniversalTime().ToString("o")
+        failureCount = $failureCount
+    }
+    $alert | ConvertTo-Json | Set-Content -Path $healthAlertFile -Encoding UTF8
+    Write-Log "Health notification: $message"
+
+    $msg = Get-Command msg.exe -ErrorAction SilentlyContinue
+    if ($msg) {
+        & $msg.Source $env:USERNAME /TIME:60 $message 2>$null | Out-Null
+    }
 }
 
 function Test-Port {
@@ -160,6 +208,29 @@ function Start-DevStart {
 
 $resolvedRole = Get-Role -RequestedRole $Role
 Write-Log "Automation run started. Role=$resolvedRole HealthCheckOnly=$HealthCheckOnly"
+
+if ($HealthCheckOnly) {
+    $localMcpUp = Test-Port -ComputerName "127.0.0.1" -Port 8765
+    if (-not $localMcpUp) {
+        Write-Log "Local MCP is down. Starting the local stack."
+        if ($resolvedRole -eq "Head") {
+            Start-DevStart -RayHead
+        } else {
+            Start-DevStart
+        }
+        Start-Sleep -Seconds 10
+        $localMcpUp = Test-Port -ComputerName "127.0.0.1" -Port 8765
+    }
+
+    Update-HealthNotification -Healthy $localMcpUp
+    if ($localMcpUp) {
+        Write-Log "Local MCP health check passed."
+        exit 0
+    }
+
+    Write-Log "Local MCP health check failed."
+    exit 1
+}
 
 if ($resolvedRole -eq "Head") {
     $localMcpUp = Test-Port -ComputerName "127.0.0.1" -Port 8765
