@@ -95,6 +95,36 @@ class TestSubmit:
         tasks = orch.list_tasks()
         assert len(tasks) >= 1
 
+    @pytest.mark.asyncio
+    async def test_auto_pentest_run_requires_explicit_authorization(self, orch):
+        result = await orch.submit("auto_pentest_run", {
+            "target_range": "192.168.1.10",
+            "scope_id": "AUTH-001",
+            "actor_role": "security_analyst",
+        })
+
+        assert "authorized=True is required" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_auto_recovery_run_routes_to_workflow_manager(self, orch, monkeypatch):
+        class FakeManager:
+            async def run_device_recovery(self, **kwargs):
+                return {"workflow": "recovery", "device_serial": kwargs["device_serial"]}
+
+        monkeypatch.setattr(
+            "zeropoint.control_plane.autonomous_mode.AutonomousWorkflowManager",
+            FakeManager,
+        )
+        result = await orch.submit("auto_recovery_run", {
+            "device_name": "emulator-5554",
+            "scope_id": "REC-001",
+            "authorized": True,
+            "actor_role": "recovery_tech",
+        })
+
+        assert result["workflow"] == "recovery"
+        assert result["device_serial"] == "emulator-5554"
+
 
 class TestClassifyIT:
     @pytest.mark.asyncio

@@ -39,6 +39,10 @@ TASK_TYPES = {
     "triage_alert":         "Triage a security alert and suggest response.",
     "translate_text":       "Translate text to a target language.",
     "embed_text":           "Generate a text embedding vector.",
+    "auto_pentest_plan":    "Create an authorized pentest workflow plan.",
+    "auto_pentest_run":     "Run an authorized pentest workflow.",
+    "auto_recovery_plan":   "Create a device recovery workflow plan.",
+    "auto_recovery_run":    "Run an authorized device recovery workflow.",
 }
 
 
@@ -278,9 +282,64 @@ class AIOrchestrator:
             "triage_alert":       self._handle_triage_alert,
             "translate_text":     self._handle_translate,
             "embed_text":         self._handle_embed,
+            "auto_pentest_plan":  self._handle_auto_pentest_plan,
+            "auto_pentest_run":   self._handle_auto_pentest_run,
+            "auto_recovery_plan": self._handle_auto_recovery_plan,
+            "auto_recovery_run":  self._handle_auto_recovery_run,
         }
         handler = handlers.get(task.task_type, self._handle_unknown)
         return await handler(task.payload)
+
+    @staticmethod
+    def _workflow_target(payload: dict) -> str:
+        return str(payload.get("target") or payload.get("target_range") or "").strip()
+
+    async def _handle_auto_pentest_plan(self, payload: dict) -> dict:
+        from zeropoint.control_plane.autonomous_mode import AutonomousWorkflowManager
+
+        manager = AutonomousWorkflowManager()
+        return manager.plan_pentest(
+            self._workflow_target(payload),
+            allow_public=bool(payload.get("allow_public", False)),
+        )
+
+    async def _handle_auto_pentest_run(self, payload: dict) -> dict:
+        from zeropoint.control_plane.autonomous_mode import AutonomousWorkflowManager
+
+        manager = AutonomousWorkflowManager()
+        return await manager.run_pentest(
+            target=self._workflow_target(payload),
+            scope_id=str(payload.get("scope_id", "")),
+            authorized=bool(payload.get("authorized", False)),
+            actor_role=str(payload.get("actor_role", "owner")),
+            active=bool(payload.get("active", False)),
+            use_kali=bool(payload.get("use_kali", False)),
+            use_metasploit=bool(payload.get("use_metasploit", False)),
+            use_hashcat=bool(payload.get("use_hashcat", False)),
+            use_john=bool(payload.get("use_john", False)),
+            hash_file=payload.get("hash_file"),
+            hash_mode=int(payload.get("hash_mode", 0)),
+            wordlist=payload.get("wordlist"),
+            allow_public=bool(payload.get("allow_public", False)),
+        )
+
+    async def _handle_auto_recovery_plan(self, payload: dict) -> dict:
+        from zeropoint.control_plane.autonomous_mode import AutonomousWorkflowManager
+
+        manager = AutonomousWorkflowManager()
+        return manager.plan_device_recovery(str(payload.get("device_serial") or payload.get("device_name") or ""))
+
+    async def _handle_auto_recovery_run(self, payload: dict) -> dict:
+        from zeropoint.control_plane.autonomous_mode import AutonomousWorkflowManager
+
+        manager = AutonomousWorkflowManager()
+        return await manager.run_device_recovery(
+            device_serial=str(payload.get("device_serial") or payload.get("device_name") or ""),
+            scope_id=str(payload.get("scope_id", "")),
+            authorized=bool(payload.get("authorized", False)),
+            actor_role=str(payload.get("actor_role", "owner")),
+            attempt_reconnect=bool(payload.get("attempt_reconnect", True)),
+        )
 
     def _ollama_base_url(self, payload: dict[str, Any]) -> str:
         raw = (

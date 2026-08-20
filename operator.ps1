@@ -8,10 +8,10 @@
 #   .\operator.ps1 -Mode verify
 #
 #   # Run autonomous pentest on a network range
-#   .\operator.ps1 -Mode pentest -TargetRange "192.168.0.0/24" -Scope "authorized-assessment-001"
+#   .\operator.ps1 -Mode pentest -TargetRange "192.168.0.0/24" -Scope "authorized-assessment-001" -Authorized
 #
 #   # Run device recovery on connected Android device
-#   .\operator.ps1 -Mode recovery -DeviceName "OnePlus-Test" -Scope "recovery-ticket-042"
+#   .\operator.ps1 -Mode recovery -DeviceName "OnePlus-Test" -Scope "recovery-ticket-042" -Authorized
 #
 #   # List available presets
 #   .\operator.ps1 -Mode list-presets
@@ -60,7 +60,8 @@ param(
     [string]$ExecutionMode = "auto",
     [string]$HeadIp = "192.168.0.140",
     [string]$RayAddress = "",
-    [switch]$SkipVerify
+    [switch]$SkipVerify,
+    [switch]$Authorized
 )
 
 $ErrorActionPreference = "Stop"
@@ -220,6 +221,7 @@ function Run-PentestWorkflow {
         target_range = $TargetRange
         scope_id = $Scope
         actor_role = $ActorRole
+        authorized = $Authorized
         phase = $PentestPhase
         stages = $preset.stages
         use_metasploit = $UseMetasploit
@@ -255,6 +257,7 @@ function Run-RecoveryWorkflow {
         device_type = $DeviceType
         actor_role = $ActorRole
         scope_id = $Scope
+        authorized = $Authorized
         stages = $preset.stages
     } | ConvertTo-Json -Compress
     
