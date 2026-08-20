@@ -13,60 +13,31 @@
   // VS Code settings required (settings.json):
   //   "github.copilot.chat.agent.mcpServers": true
 
+  // NOTE: All ZeroPoint server entries were removed (not just disabled).
+  // The ZeroPoint MCP server currently only exposes a WebSocket endpoint at
+  // /mcp, which VS Code's MCP client cannot speak (it expects Streamable
+  // HTTP or stdio). Leaving an "http" entry here, even with "enabled": false,
+  // still caused VS Code to attempt a connection and trigger OAuth dynamic
+  // client registration prompts. See:
+  //   tasks/pending/vscode-mcp-transport-integration.md
+  // Re-add a server entry here only after a stdio or Streamable HTTP adapter
+  // has been implemented and tested against a real MCP handshake.
   "servers": {
-    // -----------------------------------------------------------------------
-    // ZeroPoint MCP — primary local server
-    // Exposes: filesystem, webtools, adb, android/camnet tools
-    // -----------------------------------------------------------------------
     "zeropoint": {
-      "type": "http",
-      "url": "http://localhost:8765/mcp",
-      "headers": {
-        "Authorization": "Bearer ${env:MCP_AUTH_TOKEN}"
-      },
-      "description": "ZeroPoint AI stack — filesystem, webtools, ADB, and CamNet Android automation.",
-      "enabled": true
-    },
-
-    // -----------------------------------------------------------------------
-    // ZeroPoint MCP — SSE stream endpoint (for streaming tool responses)
-    // Used by clients that prefer Server-Sent Events over plain HTTP POST.
-    // -----------------------------------------------------------------------
-    "zeropoint-sse": {
-      "type": "sse",
-      "url": "http://localhost:8765/sse",
-      "headers": {
-        "Authorization": "Bearer ${env:MCP_AUTH_TOKEN}"
-      },
-      "description": "ZeroPoint MCP streaming (SSE) endpoint.",
-      "enabled": false
-    },
-
-    // -----------------------------------------------------------------------
-    // Filesystem tool (direct stdio mode — alternative to HTTP)
-    // Use this if you want the filesystem server to run as a subprocess
-    // managed entirely by VS Code rather than your dev_start.ps1 process.
-    // Requires: .venv\Scripts\python.exe to exist (run installer first).
-    // -----------------------------------------------------------------------
-    "zeropoint-fs-stdio": {
       "type": "stdio",
       "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
       "args": [
         "-m",
         "zeropoint.server",
-        "--config",
-        "${workspaceFolder}\\config\\mcp_server_config.yaml",
-        "--tools",
-        "filesystem",
         "--transport",
-        "stdio"
+        "stdio",
+        "--config",
+        "${workspaceFolder}\\config\\mcp_server_config.yaml"
       ],
       "env": {
-        "MCP_AUTH_TOKEN": "${env:MCP_AUTH_TOKEN}",
         "PYTHONPATH": "${workspaceFolder}"
       },
-      "description": "ZeroPoint filesystem tool — stdio subprocess mode.",
-      "enabled": false
+      "description": "ZeroPoint local filesystem and web tools."
     }
   },
 

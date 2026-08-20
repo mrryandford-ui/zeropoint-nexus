@@ -14,7 +14,7 @@ $RayPort = 6379
 $RayClientPort = 10001
 $McpPort = 8765
 $IdentityPort = 8766
-$PythonPath = "C:\Users\zeroi\Downloads\zeropoint-mcp\.venv\Scripts\python.exe"
+$PythonPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) ".venv\Scripts\python.exe"
 
 # Helper functions
 function OK  ($m) { Write-Host "  [OK]  $m" -ForegroundColor Green  }

@@ -26,6 +26,12 @@ Build a **local-first, two-node AI operations platform** that can:
 - Documentation across older markdown files is inconsistent with current runtime state.
 - Autonomous "give target and run end-to-end" mode is not implemented yet.
 
+### Operating Decision
+
+- ZERO-DEV must remain fully usable as a single-machine local-first installation.
+- ZERO-FLD is optional capacity for heavier or distributed workloads, not a prerequisite for normal operation.
+- When ZERO-FLD is unavailable, the system should continue locally where supported and clearly report when a requested task requires remote capacity.
+
 ## 3) Target End State
 
 Operator provides one high-level intent:

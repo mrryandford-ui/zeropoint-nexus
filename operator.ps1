@@ -69,7 +69,7 @@ $ErrorActionPreference = "Stop"
 # CONFIGURATION & GLOBALS
 # ============================================================================
 
-$RootDir = "C:\Users\zeroi\Downloads\zeropoint-mcp"
+$RootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PythonExe = Join-Path $RootDir ".venv\Scripts\python.exe"
 $VerifyScript = Join-Path $RootDir "verify_cluster_connection.ps1"
 $SubmitScript = Join-Path $RootDir "scripts\ai_submit.ps1"

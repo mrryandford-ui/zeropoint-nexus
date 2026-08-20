@@ -188,6 +188,65 @@ def build_app(config_path: str) -> web.Application:
     app.on_shutdown.append(on_shutdown)
     return app
 
+
+async def run_stdio(config_path: str) -> None:
+    registry = ToolRegistry(config_path)
+    registry.load()
+    await registry.startup()
+    initialized = False
+
+    try:
+        while True:
+            raw = await asyncio.to_thread(sys.stdin.readline)
+            if not raw:
+                break
+            try:
+                request = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                response = _err(None, -32700, f"Parse error: {exc}")
+                sys.stdout.write(json.dumps(response) + "\n")
+                sys.stdout.flush()
+                continue
+
+            request_id = request.get("id")
+            method = request.get("method", "")
+            params = request.get("params", {})
+
+            if method == "initialize":
+                initialized = True
+                response = _ok(request_id, {
+                    "protocolVersion": MCPHandler.PROTOCOL_VERSION,
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": MCPHandler.SERVER_INFO,
+                })
+            elif method == "tools/list":
+                response = (
+                    _ok(request_id, {"tools": registry.list_tools()})
+                    if initialized
+                    else _err(request_id, -32002, "Server not initialized")
+                )
+            elif method == "tools/call":
+                if not initialized:
+                    response = _err(request_id, -32002, "Server not initialized")
+                else:
+                    tool_name = params.get("name", "")
+                    result = await registry.call(tool_name, params.get("arguments", {}))
+                    record_tool_call(tool_name, success=not result.get("isError", False))
+                    response = _ok(request_id, result)
+            elif method == "ping":
+                response = _ok(request_id, {})
+            elif method == "shutdown":
+                response = _ok(request_id, {})
+            elif request_id is not None:
+                response = _err(request_id, -32601, f"Method not found: {method}")
+            else:
+                continue
+
+            sys.stdout.write(json.dumps(response) + "\n")
+            sys.stdout.flush()
+    finally:
+        await registry.shutdown()
+
 ###############################################################################
 # CLI
 ###############################################################################
@@ -215,12 +274,19 @@ def get_active_ip() -> str:
 @click.option("--log-level", default="INFO",
               type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]),
               show_default=True)
-def main(config: str, host: str | None, port: int | None, log_level: str) -> None:
-    """ZeroPoint MCP Server — start the WebSocket MCP endpoint."""
+@click.option("--transport", default="websocket",
+              type=click.Choice(["websocket", "stdio"]), show_default=True)
+def main(config: str, host: str | None, port: int | None, log_level: str, transport: str) -> None:
+    """ZeroPoint MCP Server — start the selected MCP transport."""
     logging.basicConfig(
         level=getattr(logging, log_level),
         format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+        stream=sys.stderr,
     )
+
+    if transport == "stdio":
+        asyncio.run(run_stdio(config))
+        return
 
     # Dynamic IP detection and update in config
     try:

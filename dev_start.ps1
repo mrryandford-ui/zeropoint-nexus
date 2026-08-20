@@ -10,7 +10,7 @@ param(
     [switch]$Stop
 )
 
-$ROOT   = "C:\Users\zeroi\Downloads\zeropoint-mcp"
+$ROOT   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VENV   = "$ROOT\.venv"
 $PY     = "$VENV\Scripts\python.exe"
 $ENV    = "$ROOT\config\.env"

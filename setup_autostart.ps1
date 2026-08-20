@@ -11,8 +11,8 @@ param(
 $TaskName = "ZeroPoint-MCP-Autostart"
 $TaskPath = "\ZeroPoint\"
 $FullTaskName = "$TaskPath$TaskName"
-$ScriptPath = "C:\Users\zeroi\Downloads\zeropoint-mcp\dev_start.ps1"
-$LogPath = "C:\Users\zeroi\Downloads\zeropoint-mcp\autostart.log"
+$ScriptPath = Join-Path $PSScriptRoot "dev_start.ps1"
+$LogPath = Join-Path $PSScriptRoot "autostart.log"
 
 # Helper functions
 function OK  ($m) { Write-Host "  [OK]  $m" -ForegroundColor Green  }
