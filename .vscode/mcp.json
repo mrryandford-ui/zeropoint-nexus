@@ -51,11 +51,9 @@
       "tools": [
         "zeropoint://filesystem_read",
         "zeropoint://filesystem_list",
-        "zeropoint://filesystem_search",
         "zeropoint://webtools_fetch",
         "zeropoint://webtools_scrape",
-        "zeropoint://adb_devices",
-        "zeropoint://adb_screenshot"
+        "zeropoint://webtools_search"
       ]
     },
     "zeropoint-full": {
@@ -64,31 +62,9 @@
         "zeropoint://filesystem_read",
         "zeropoint://filesystem_write",
         "zeropoint://filesystem_list",
-        "zeropoint://filesystem_search",
-        "zeropoint://filesystem_delete",
         "zeropoint://webtools_fetch",
         "zeropoint://webtools_scrape",
-        "zeropoint://webtools_search",
-        "zeropoint://adb_devices",
-        "zeropoint://adb_shell",
-        "zeropoint://adb_push",
-        "zeropoint://adb_pull",
-        "zeropoint://adb_install_apk",
-        "zeropoint://adb_screenshot",
-        "zeropoint://adb_logcat",
-        "zeropoint://android_tap",
-        "zeropoint://android_swipe",
-        "zeropoint://android_type_text",
-        "zeropoint://android_launch_app",
-        "zeropoint://android_ui_dump",
-        "zeropoint://android_back",
-        "zeropoint://android_home",
-        "zeropoint://camnet_status",
-        "zeropoint://camnet_capture_all",
-        "zeropoint://camnet_capture_device",
-        "zeropoint://camnet_sync_media",
-        "zeropoint://camnet_connect_all",
-        "zeropoint://camnet_health_check"
+        "zeropoint://webtools_search"
       ]
     }
   }
