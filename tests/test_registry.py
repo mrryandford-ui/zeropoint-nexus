@@ -8,10 +8,11 @@ Run: pytest tests/test_registry.py -v
 
 from __future__ import annotations
 
+import importlib
 import json
-import tempfile
+import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -73,6 +74,17 @@ class {class_name}(BaseTool):
 """)
 
 
+def _purge_cached_modules(prefix: str) -> None:
+    """Remove any already-imported modules whose name starts with *prefix*.
+
+    This ensures monkeypatch.syspath_prepend can shadow real production modules
+    when the real package has already been imported earlier in the test session.
+    """
+    to_delete = [k for k in sys.modules if k == prefix or k.startswith(prefix + ".")]
+    for key in to_delete:
+        del sys.modules[key]
+
+
 ###############################################################################
 # _snake_to_camel
 ###############################################################################
@@ -89,6 +101,7 @@ def test_snake_to_camel_basic():
 
 def test_registry_load_and_instance_cache(tmp_path, monkeypatch):
     """Two tools in the same module share one instance."""
+    _purge_cached_modules("zeropoint.tools.filesystem")
     monkeypatch.syspath_prepend(str(tmp_path))
     _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
 
@@ -115,6 +128,7 @@ def test_registry_load_and_instance_cache(tmp_path, monkeypatch):
 
 
 def test_registry_disabled_module_skipped(tmp_path, monkeypatch):
+    _purge_cached_modules("zeropoint.tools.filesystem")
     monkeypatch.syspath_prepend(str(tmp_path))
     _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
 
@@ -134,6 +148,7 @@ def test_registry_disabled_module_skipped(tmp_path, monkeypatch):
 
 def test_registry_bad_module_reported(tmp_path, monkeypatch, caplog):
     """A tool pointing to a non-existent module must emit a WARNING summary."""
+    _purge_cached_modules("zeropoint.tools.nonexistent_module")
     monkeypatch.syspath_prepend(str(tmp_path))
     _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
 
@@ -162,6 +177,7 @@ def test_registry_bad_module_reported(tmp_path, monkeypatch, caplog):
 
 @pytest.mark.asyncio
 async def test_call_unknown_tool(tmp_path, monkeypatch):
+    _purge_cached_modules("zeropoint.tools.filesystem")
     monkeypatch.syspath_prepend(str(tmp_path))
     _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
 
@@ -184,7 +200,14 @@ async def test_call_unknown_tool(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_call_op_stripping(tmp_path, monkeypatch):
-    """filesystem_read -> op 'read' must be passed as _op."""
+    """filesystem_read -> op 'read' must be passed as _op.
+
+    The mock BaseTool.safe_execute always returns isError=False regardless of
+    path, so this test is fully isolated from any production allowed_roots check.
+    We explicitly purge any cached real zeropoint.tools.filesystem module before
+    prepending tmp_path so the registry always loads the mock.
+    """
+    _purge_cached_modules("zeropoint.tools.filesystem")
     monkeypatch.syspath_prepend(str(tmp_path))
     _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
 
@@ -212,6 +235,7 @@ async def test_call_op_stripping(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_startup_shutdown_called_once_per_instance(tmp_path, monkeypatch):
     """startup/shutdown called exactly once per unique instance, not per tool name."""
+    _purge_cached_modules("zeropoint.tools.filesystem")
     monkeypatch.syspath_prepend(str(tmp_path))
     _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
 
@@ -257,6 +281,7 @@ async def test_startup_shutdown_called_once_per_instance(tmp_path, monkeypatch):
 ###############################################################################
 
 def test_list_tools_returns_registered_only(tmp_path, monkeypatch):
+    _purge_cached_modules("zeropoint.tools.filesystem")
     monkeypatch.syspath_prepend(str(tmp_path))
     _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
 
