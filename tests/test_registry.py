@@ -8,17 +8,16 @@ Run: pytest tests/test_registry.py -v
 
 from __future__ import annotations
 
-import importlib
 import json
-import sys
 import types
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 import yaml
 
 from zeropoint.registry import ToolRegistry, _snake_to_camel
+from zeropoint.tools.base import BaseTool, ToolResult
 
 
 ###############################################################################
@@ -45,20 +44,20 @@ def _make_manifest(tools: list[dict], config_path: Path) -> None:
 
 
 def _make_mock_module(class_name: str) -> types.ModuleType:
-    """Return a fresh in-memory module containing a minimal BaseTool subclass.
+    """Return an in-memory module with a concrete BaseTool subclass.
 
-    This is used to patch importlib.import_module so that the registry never
-    touches the real zeropoint.tools.* package, regardless of sys.path or the
-    editable install.  The mock BaseTool.safe_execute always returns
-    isError=False, so tests are completely isolated from production logic such
-    as allowed_roots enforcement in the real FilesystemTool.
+    The subclass implements the abstract execute() method, returning a
+    ToolResult whose data echoes the _op param.  safe_execute() in BaseTool
+    then wraps it into the standard MCP dict with isError absent/False.
     """
-    from zeropoint.tools.base import BaseTool  # real base is fine to use
 
     class _MockTool(BaseTool):
-        async def safe_execute(self, params):
+        name = "mock"
+        description = "mock tool"
+
+        async def execute(self, params: dict) -> ToolResult:
             op = params.get("_op", "")
-            return {"isError": False, "content": [{"type": "text", "text": f"op:{op}"}]}
+            return ToolResult(data={"text": f"op:{op}"})
 
     _MockTool.__name__ = class_name
     _MockTool.__qualname__ = class_name
@@ -138,7 +137,6 @@ def test_registry_bad_module_reported(tmp_path, caplog):
     )
 
     import logging
-    # Let import_module raise ImportError for the non-existent module
     with patch(
         "zeropoint.registry.importlib.import_module",
         side_effect=ImportError("No module named 'zeropoint.tools.nonexistent_module'"),
@@ -182,9 +180,8 @@ async def test_call_unknown_tool(tmp_path):
 async def test_call_op_stripping(tmp_path):
     """filesystem_read -> op 'read' must be passed as _op.
 
-    importlib.import_module is patched at the registry seam so the real
-    zeropoint.tools.filesystem (with allowed_roots enforcement) is never
-    loaded, regardless of the editable install on sys.path.
+    importlib.import_module is patched so the real zeropoint.tools.filesystem
+    (with allowed_roots enforcement) is never loaded.
     """
     mock_mod = _make_mock_module("FilesystemTool")
 
@@ -202,8 +199,9 @@ async def test_call_op_stripping(tmp_path):
         registry.load()
 
     result = await registry.call("filesystem_read", {"path": "/tmp"})
-    assert result["isError"] is False
-    assert "op:read" in result["content"][0]["text"]
+    assert result.get("isError") is not True
+    content_text = result["content"][0]["text"]
+    assert "op:read" in content_text
 
 
 ###############################################################################
