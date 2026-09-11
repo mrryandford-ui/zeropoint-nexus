@@ -7,6 +7,7 @@ venv/
 env/
 **/.venv/
 **/venv/
+**/__pycache__/
 
 # Test/cache artifacts
 .pytest_cache/
@@ -14,18 +15,30 @@ env/
 .ruff_cache/
 .coverage
 htmlcov/
+coverage.xml
 
 # Jupyter
 .ipynb_checkpoints/
+*.ipynb
 
 # Logs and runtime outputs
 *.log
 logs/
+tasks/
+*.txt
+!README*.txt
+!SOURCES.txt
 
 # Editor and OS
-.vscode/
 .DS_Store
 Thumbs.db
+.continue/
+
+# VS Code — keep .vscode/mcp.json and .vscode/settings.json, ignore generated files
+.vscode/*
+!.vscode/mcp.json
+!.vscode/settings.json
+!.vscode/extensions.json
 
 # Local secrets / env
 .env
@@ -37,3 +50,27 @@ config/.env
 dist/
 build/
 *.egg-info/
+
+# Backup files created by registry/governance scripts
+*.bak
+*.bak_*
+
+# Ghost / temp files
+*.ps1.txt
+*.py.txt
+
+# Large generated source dumps (use git history or zp_split_source.ps1 instead)
+zeropoint-all-python-source.txt
+
+# Node / npm (if any tooling is added)
+node_modules/
+package-lock.json
+
+# Windows system files
+desktop.ini
+$RECYCLE.BIN/
+
+# Runtime state files (local only, not for version control)
+bootstrap_log.txt
+install_log.txt
+*.bak_*

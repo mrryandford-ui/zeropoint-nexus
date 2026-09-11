@@ -1,5 +1,34 @@
-mcp-types==2.0.0
-mcp==2.0.0
-pydantic
-ray
-uvicorn
+# ZeroPoint MCP — core runtime dependencies
+# Synced with pyproject.toml [project.dependencies]
+# Install: pip install -r requirements.txt
+# For dev tools (pytest, black, ruff, mypy): pip install -e ".[dev]"
+
+# HTTP server + CLI
+aiohttp>=3.9
+click>=8.1
+pyyaml>=6.0
+rich>=13.0
+
+# Web scraping
+beautifulsoup4>=4.12
+lxml>=5.0
+requests>=2.32
+
+# Ray distributed compute
+ray[default]>=2.34.0
+ray[serve]>=2.34.0
+
+# Android automation
+uiautomator2>=3.0
+appium-python-client>=3.1
+
+# Observability
+prometheus-client>=0.20
+opentelemetry-sdk>=1.25
+opentelemetry-exporter-otlp>=1.25
+
+# MCP protocol
+mcp>=2.0.0
+
+# Data validation (pulled in by mcp/aiohttp, pinned for clarity)
+pydantic>=2.0
