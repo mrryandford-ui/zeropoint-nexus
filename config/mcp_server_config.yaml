@@ -42,3 +42,19 @@ tools:
       rate_limit:
         requests_per_minute: 60
         burst: 10
+  adb:
+    enabled: true
+    module: zeropoint.tools.adb
+    class: AdbTool
+    config:
+      adb_binary: "C:\\platform-tools\\adb.exe"
+      adb_server_host: "127.0.0.1"
+      adb_server_port: 5037
+  android:
+    enabled: true
+    module: zeropoint.tools.android.tool
+    class: AndroidTool
+    config:
+      screenshot_dir: "C:\\ZeroPoint\\data\\camnet\\screenshots"
+      video_dir: "C:\\ZeroPoint\\data\\camnet\\recordings"
+      camnet: {}

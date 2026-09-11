@@ -45,6 +45,9 @@ class ToolRegistry:
         self._tools: dict[str, BaseTool] = {}
         # module_name -> config dict (from mcp_server_config.yaml tools section)
         self._module_cfg: dict[str, dict] = {}
+        # tool_name -> module_name (from the manifest), used to derive the
+        # operation name passed to multi-operation tools like AndroidTool.
+        self._tool_module: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Loading
@@ -115,6 +118,7 @@ class ToolRegistry:
             instance = self._tool_instances()[instance_key]
 
         self._tools[tool_name] = instance
+        self._tool_module[tool_name] = py_module
         logger.debug("Registered tool '%s' → %s", tool_name, instance)
 
     def _tool_instances(self) -> dict[str, BaseTool]:
@@ -164,9 +168,16 @@ class ToolRegistry:
                 f"Available: {sorted(self._tools.keys())}",
                 code="UNKNOWN_TOOL",
             ).to_mcp()
-        _, separator, operation = tool_name.partition("_")
+        # Derive the operation by stripping the tool's module prefix (e.g.
+        # "filesystem_read" + module "filesystem" -> op "read"). Tool names
+        # that don't share the module's prefix (e.g. "camnet_status" under
+        # the "android" module) are passed through unchanged as the op, so
+        # each tool's dispatch table must have a matching key.
+        module_name = self._tool_module.get(tool_name, "")
+        prefix = f"{module_name}_"
+        operation = tool_name[len(prefix):] if module_name and tool_name.startswith(prefix) else tool_name
         tool_params = dict(params)
-        if separator and operation:
+        if operation:
             tool_params["_op"] = operation
         return await tool.safe_execute(tool_params)
 

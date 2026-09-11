@@ -1,5 +1,7 @@
 # ZeroPoint MCP Cluster Configuration & Status
 
+> Status note (2026-09-11): This document describes the last recorded two-node cluster state. Local MCP and scheduled-task autostart validation has completed, but ZERO-FLD/Ray connectivity was not revalidated during the current handoff. See [PROJECT_SCOPE_HANDOFF.md](PROJECT_SCOPE_HANDOFF.md) for the authoritative current workspace status.
+
 ## 🏗️ Current Cluster Architecture
 
 ### Cluster Name: `ZeroPoint-MCP`

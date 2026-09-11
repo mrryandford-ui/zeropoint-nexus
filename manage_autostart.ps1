@@ -10,9 +10,18 @@ param(
     [switch]$Remove
 )
 
-$StartupPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
-$BatFile = "$StartupPath\ZeroPoint-MCP-Start.bat"
-$McpRoot = "C:\Users\zeroi\Downloads\zeropoint-mcp"
+$TaskName = "ZeroPoint-MCP-Autostart"
+$TaskPath = "\ZeroPoint\"
+$FullTaskName = "$TaskPath$TaskName"
+$StartupFiles = @(
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\ZeroPoint-MCP-Start.bat",
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\ZeroPoint-MCP-Start.bat",
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\Start ZeroPoint MCP.lnk",
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\Start ZeroPoint MCP.lnk",
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\ZeroPoint-Cluster-Autostart.lnk",
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\ZeroPoint-Cluster-Autostart.lnk"
+)
+$McpRoot = $PSScriptRoot
 $LogPath = "$McpRoot\autostart.log"
 
 # Helper functions
@@ -35,10 +44,14 @@ if (-not ($Check -or $Disable -or $Enable -or $Remove)) {
 if ($Check) {
     INF "Checking autostart status..."
     Write-Host ""
-    
-    if (Test-Path $BatFile) {
+
+    $task = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
+    if ($task) {
         OK "Autostart ENABLED"
-        Write-Host "  Location: $BatFile" -ForegroundColor Gray
+        Write-Host "  Task: $FullTaskName" -ForegroundColor Gray
+
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
+        Write-Host "  State: $($task.State); Last result: $($taskInfo.LastTaskResult)" -ForegroundColor Gray
         
         # Check if server is running
         try {
@@ -56,7 +69,13 @@ if ($Check) {
         }
     } else {
         WRN "Autostart DISABLED"
-        Write-Host "  Location: $BatFile (not found)"
+        Write-Host "  Task: $FullTaskName (not found)"
+    }
+
+    $legacyFiles = $StartupFiles | Where-Object { Test-Path $_ }
+    if ($legacyFiles) {
+        WRN "Legacy Startup-folder launcher(s) found:"
+        $legacyFiles | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
     }
     
     Write-Host ""
@@ -70,39 +89,44 @@ if ($Check) {
 }
 
 if ($Disable) {
-    if (Test-Path $BatFile) {
-        Rename-Item -Path $BatFile -NewName "$($BatFile).disabled" -Force
+    $task = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
+    if ($task) {
+        Disable-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath | Out-Null
         OK "Autostart DISABLED"
-        Write-Host "  File: $BatFile -> $BatFile.disabled" -ForegroundColor Gray
+        Write-Host "  Task: $FullTaskName" -ForegroundColor Gray
     } else {
-        WRN "Startup file not found"
+        WRN "Scheduled task not found"
     }
     exit 0
 }
 
 if ($Enable) {
-    if (Test-Path "$BatFile.disabled") {
-        Rename-Item -Path "$BatFile.disabled" -NewName $BatFile -Force
+    $task = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
+    if ($task) {
+        Enable-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath | Out-Null
         OK "Autostart ENABLED"
-        Write-Host "  File: $BatFile.disabled -> $BatFile" -ForegroundColor Gray
-    } elseif (Test-Path $BatFile) {
-        OK "Autostart already ENABLED"
+        Write-Host "  Task: $FullTaskName" -ForegroundColor Gray
     } else {
-        ERR "Startup file not found"
+        ERR "Scheduled task not found"
         WRN "Run setup_autostart.ps1 first"
     }
     exit 0
 }
 
 if ($Remove) {
-    $batToRemove = if (Test-Path $BatFile) { $BatFile } else { "$BatFile.disabled" }
-    
-    if (Test-Path $batToRemove) {
-        Remove-Item -Path $batToRemove -Force -ErrorAction SilentlyContinue
-        OK "Autostart removed"
-        Write-Host "  Deleted: $batToRemove" -ForegroundColor Gray
+    $task = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
+    if ($task) {
+        Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false
+        OK "Scheduled-task autostart removed"
     } else {
-        WRN "Startup file not found"
+        WRN "Scheduled task not found"
+    }
+
+    foreach ($startupFile in $StartupFiles) {
+        if (Test-Path $startupFile) {
+            Remove-Item -Path $startupFile -Force -ErrorAction SilentlyContinue
+            OK "Removed legacy Startup-folder launcher: $startupFile"
+        }
     }
     exit 0
 }

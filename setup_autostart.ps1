@@ -13,6 +13,14 @@ $TaskPath = "\ZeroPoint\"
 $FullTaskName = "$TaskPath$TaskName"
 $ScriptPath = Join-Path $PSScriptRoot "dev_start.ps1"
 $LogPath = Join-Path $PSScriptRoot "autostart.log"
+$LegacyStartupFiles = @(
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\ZeroPoint-MCP-Start.bat",
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\ZeroPoint-MCP-Start.bat",
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\Start ZeroPoint MCP.lnk",
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\Start ZeroPoint MCP.lnk",
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\ZeroPoint-Cluster-Autostart.lnk",
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\ZeroPoint-Cluster-Autostart.lnk"
+)
 
 # Helper functions
 function OK  ($m) { Write-Host "  [OK]  $m" -ForegroundColor Green  }
@@ -96,7 +104,7 @@ $TaskSettings = New-ScheduledTaskSettingsSet `
 $task = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
 if ($task) {
     INF "Task already exists. Updating..."
-    $task | Set-ScheduledTask -Action $TaskAction -Trigger $TaskTrigger -Principal $TaskPrincipal -Settings $TaskSettings | Out-Null
+    Set-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Action $TaskAction -Trigger $TaskTrigger -Principal $TaskPrincipal -Settings $TaskSettings | Out-Null
 } else {
     Register-ScheduledTask `
         -TaskName $TaskName `
@@ -109,6 +117,14 @@ if ($task) {
 }
 
 OK "Task created/updated: $FullTaskName"
+
+foreach ($legacyStartupFile in $LegacyStartupFiles) {
+    if (Test-Path $legacyStartupFile) {
+        Remove-Item -Path $legacyStartupFile -Force -ErrorAction SilentlyContinue
+        OK "Removed legacy Startup-folder launcher: $legacyStartupFile"
+    }
+}
+
 Write-Host ""
 Write-Host "Task Details:" -ForegroundColor Cyan
 Write-Host "  Trigger: At System Startup"

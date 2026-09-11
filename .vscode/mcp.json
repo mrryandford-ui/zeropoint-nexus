@@ -6,32 +6,38 @@
   // Prerequisites:
   //   1. Run install_zeropoint_windows.ps1 as Administrator (one-time)
   //   2. Run dev_start.ps1 to start the local MCP server
-  //   3. Set MCP_AUTH_TOKEN in your environment (from config/.env)
-  //      or VS Code will fall back to the value in config/.env automatically
-  //      if the server is started via dev_start.ps1.
+  //      (this starts the persistent server on http://localhost:8765)
+  //   3. The bearer token is read from config\.env (MCP_AUTH_TOKEN). VS Code
+  //      will prompt for it once and store it securely; paste the value of
+  //      MCP_AUTH_TOKEN from config\.env when prompted.
   //
   // VS Code settings required (settings.json):
   //   "github.copilot.chat.agent.mcpServers": true
 
-  // ZeroPoint uses stdio because the HTTP endpoint is WebSocket-only.
+  // ZeroPoint's persistent MCP service listens on Streamable HTTP at
+  // http://localhost:8765/mcp (VS Code's MCP client does not support the
+  // WebSocket transport that was previously advertised here). The legacy
+  // WebSocket endpoint at ws://localhost:8765/mcp remains available for
+  // backward compatibility but is not used by VS Code.
   "servers": {
     "zeropoint": {
-      "type": "stdio",
-      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-      "args": [
-        "-m",
-        "zeropoint.server",
-        "--transport",
-        "stdio",
-        "--config",
-        "${workspaceFolder}\\config\\mcp_server_config.yaml"
-      ],
-      "env": {
-        "PYTHONPATH": "${workspaceFolder}"
+      "type": "http",
+      "url": "http://localhost:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:zeropoint-mcp-token}"
       },
-      "description": "ZeroPoint local filesystem and web tools."
+      "description": "ZeroPoint local filesystem, web, ADB, and Android/CamNet tools."
     }
   },
+
+  "inputs": [
+    {
+      "id": "zeropoint-mcp-token",
+      "type": "promptString",
+      "description": "ZeroPoint MCP bearer token (value of MCP_AUTH_TOKEN in config\\.env)",
+      "password": true
+    }
+  ],
 
   // -----------------------------------------------------------------------
   // Tool visibility — which tools Copilot may use by default.
@@ -56,7 +62,19 @@
         "zeropoint://filesystem_list",
         "zeropoint://webtools_fetch",
         "zeropoint://webtools_scrape",
-        "zeropoint://webtools_search"
+        "zeropoint://webtools_search",
+        "zeropoint://adb_shell",
+        "zeropoint://adb_push",
+        "zeropoint://adb_pull",
+        "zeropoint://adb_logcat",
+        "zeropoint://adb_screencap",
+        "zeropoint://adb_install",
+        "zeropoint://android_tap",
+        "zeropoint://android_swipe",
+        "zeropoint://android_input_text",
+        "zeropoint://android_camera_capture",
+        "zeropoint://camnet_status",
+        "zeropoint://camnet_sync"
       ]
     }
   }

@@ -1,6 +1,24 @@
 # ZeroPoint MCP Project Scope & Handoff
 
-Last updated: 2026-08-20 (local MCP stabilization and VS Code stdio integration)
+Last updated: 2026-09-11 (MCP/autostart workspace handoff)
+
+## Current Workspace Handoff - 2026-09-11
+
+- The local-first MCP and scheduled-task autostart changes in the working tree compile and parse successfully.
+- `git diff --check` is clean.
+- Pytest was not available in the active virtual environment, so the full test suite was not rerun for this checkpoint.
+- The working tree also contains generated caches, local dependency installs, temporary upload data, binaries, and duplicated workspace folders. These are local artifacts and are excluded from the handoff commit.
+- `main` is synchronized with `origin/main`; the intentional changes below are pending commit and push.
+- Remote ZERO-FLD/Ray connectivity remains unverified. Do not interpret local MCP or autostart validation as proof that the distributed cluster is healthy.
+
+### Intentional pending changes
+
+- MCP registry/server behavior and package metadata.
+- VS Code and YAML MCP configuration, including ADB and Android tool registration.
+- Scheduled-task autostart setup, management, and operator documentation.
+- Local node identity metadata.
+
+The authoritative next step is to commit this focused set, push it to `origin/main`, and then verify the clean worktree.
 
 ## 1) Mission
 

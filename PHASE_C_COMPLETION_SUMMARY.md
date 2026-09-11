@@ -1,5 +1,7 @@
 # Phase C Progress Update - December 8, 2026
 
+> Historical snapshot. Current repository and workspace status is maintained in [PROJECT_SCOPE_HANDOFF.md](PROJECT_SCOPE_HANDOFF.md). The Phase C results below were not revalidated as part of the 2026-09-11 MCP/autostart checkpoint.
+
 ## Current Status: ✅ Phase C P1 Complete + Repository Relocation
 
 ### Completed This Session

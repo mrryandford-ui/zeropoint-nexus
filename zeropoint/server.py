@@ -137,6 +137,45 @@ class MCPHandler:
         return _ok(req_id, result)
 
 ###############################################################################
+# Streamable HTTP transport (MCP spec 2025-03-26)
+###############################################################################
+#
+# VS Code's built-in MCP client does not support the raw WebSocket transport
+# used by handle_ws() above. It does support "Streamable HTTP": a single HTTP
+# endpoint that accepts POST requests carrying a JSON-RPC message and returns
+# the JSON-RPC response as a JSON body (no persistent connection required).
+# We reuse the same MCPHandler/_dispatch logic so both transports share
+# identical behavior, auth, and tool routing.
+
+async def mcp_http_handler(request: web.Request) -> web.Response:
+    handler: MCPHandler = request.app["mcp_handler"]
+
+    if handler.auth:
+        auth_header = request.headers.get("Authorization")
+        peer = request.remote or "unknown"
+        if not handler.auth.validate_header(auth_header, peer):
+            return web.json_response(
+                {"jsonrpc": "2.0", "id": None,
+                 "error": {"code": -32001, "message": "Unauthorized"}},
+                status=401,
+            )
+
+    try:
+        raw = await request.text()
+    except Exception as exc:
+        return web.json_response(
+            {"jsonrpc": "2.0", "id": None,
+             "error": {"code": -32700, "message": f"Parse error: {exc}"}},
+            status=400,
+        )
+
+    response = await handler._dispatch(raw)
+    if response is None:
+        # Notification (no "id") — MCP Streamable HTTP expects 202 Accepted.
+        return web.Response(status=202)
+    return web.json_response(response)
+
+###############################################################################
 # HTTP health endpoint
 ###############################################################################
 
@@ -172,8 +211,10 @@ def build_app(config_path: str) -> web.Application:
     app["config"] = cfg
 
     handler = MCPHandler(registry, auth, server_cfg)
+    app["mcp_handler"] = handler
 
     app.router.add_get("/mcp", handler.handle_ws)
+    app.router.add_post("/mcp", mcp_http_handler)
     app.router.add_get("/health", health_handler)
 
     async def on_startup(_app: web.Application) -> None:
@@ -195,9 +236,33 @@ async def run_stdio(config_path: str) -> None:
     await registry.startup()
     initialized = False
 
+    def read_message() -> str | None:
+        """Read newline-delimited or Content-Length-framed stdio JSON."""
+        first_line = sys.stdin.buffer.readline()
+        if not first_line:
+            return None
+
+        if first_line.lower().startswith(b"content-length:"):
+            headers = [first_line]
+            while True:
+                header = sys.stdin.buffer.readline()
+                if not header or header in (b"\r\n", b"\n"):
+                    break
+                headers.append(header)
+
+            length = next(
+                int(header.split(b":", 1)[1].strip())
+                for header in headers
+                if header.lower().startswith(b"content-length:")
+            )
+            body = sys.stdin.buffer.read(length)
+            return body.decode("utf-8")
+
+        return first_line.decode("utf-8")
+
     try:
         while True:
-            raw = await asyncio.to_thread(sys.stdin.readline)
+            raw = await asyncio.to_thread(read_message)
             if not raw:
                 break
             try:
@@ -320,7 +385,8 @@ def main(config: str, host: str | None, port: int | None, log_level: str, transp
         await runner.setup()
         site = web.TCPSite(runner, listen_host, listen_port)
         await site.start()
-        logger.info("Listening on ws://%s:%d/mcp", listen_host, listen_port)
+        logger.info("MCP (Streamable HTTP): http://%s:%d/mcp", listen_host, listen_port)
+        logger.info("MCP (WebSocket, legacy): ws://%s:%d/mcp", listen_host, listen_port)
         logger.info("Health:   http://%s:%d/health", listen_host, listen_port)
 
         stop = loop.create_future()
