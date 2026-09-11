@@ -11,8 +11,9 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+import types
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import pytest
 import yaml
@@ -43,46 +44,28 @@ def _make_manifest(tools: list[dict], config_path: Path) -> None:
     manifest_path.write_text(json.dumps(manifest))
 
 
-def _make_mock_tool_class(tmp_path: Path, module_name: str, class_name: str) -> None:
-    """Write a minimal BaseTool subclass to a temp module file."""
-    tools_dir = tmp_path / "zeropoint" / "tools"
-    tools_dir.mkdir(parents=True, exist_ok=True)
-    (tmp_path / "zeropoint" / "__init__.py").touch()
-    (tools_dir / "__init__.py").touch()
-    (tools_dir / "base.py").write_text("""
-class ToolError(Exception):
-    def __init__(self, msg, code=None):
-        self.msg = msg
-        self.code = code
-    def to_mcp(self):
-        return {"isError": True, "content": [{"type": "text", "text": self.msg}]}
+def _make_mock_module(class_name: str) -> types.ModuleType:
+    """Return a fresh in-memory module containing a minimal BaseTool subclass.
 
-class BaseTool:
-    def __init__(self, config=None):
-        self.config = config or {}
-    async def startup(self): pass
-    async def shutdown(self): pass
-    async def safe_execute(self, params):
-        op = params.get("_op", "")
-        return {"isError": False, "content": [{"type": "text", "text": f"op:{op}"}]}
-""")
-    module_file = tools_dir / f"{module_name}.py"
-    module_file.write_text(f"""
-from zeropoint.tools.base import BaseTool
-class {class_name}(BaseTool):
-    pass
-""")
-
-
-def _purge_cached_modules(prefix: str) -> None:
-    """Remove any already-imported modules whose name starts with *prefix*.
-
-    This ensures monkeypatch.syspath_prepend can shadow real production modules
-    when the real package has already been imported earlier in the test session.
+    This is used to patch importlib.import_module so that the registry never
+    touches the real zeropoint.tools.* package, regardless of sys.path or the
+    editable install.  The mock BaseTool.safe_execute always returns
+    isError=False, so tests are completely isolated from production logic such
+    as allowed_roots enforcement in the real FilesystemTool.
     """
-    to_delete = [k for k in sys.modules if k == prefix or k.startswith(prefix + ".")]
-    for key in to_delete:
-        del sys.modules[key]
+    from zeropoint.tools.base import BaseTool  # real base is fine to use
+
+    class _MockTool(BaseTool):
+        async def safe_execute(self, params):
+            op = params.get("_op", "")
+            return {"isError": False, "content": [{"type": "text", "text": f"op:{op}"}]}
+
+    _MockTool.__name__ = class_name
+    _MockTool.__qualname__ = class_name
+
+    mod = types.ModuleType(f"_mock_module_{class_name}")
+    setattr(mod, class_name, _MockTool)
+    return mod
 
 
 ###############################################################################
@@ -99,11 +82,9 @@ def test_snake_to_camel_basic():
 # ToolRegistry — load + instance cache
 ###############################################################################
 
-def test_registry_load_and_instance_cache(tmp_path, monkeypatch):
+def test_registry_load_and_instance_cache(tmp_path):
     """Two tools in the same module share one instance."""
-    _purge_cached_modules("zeropoint.tools.filesystem")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
+    mock_mod = _make_mock_module("FilesystemTool")
 
     config_path = _make_config(
         {"filesystem": {"enabled": True, "config": {"root": "/tmp"}}},
@@ -117,20 +98,17 @@ def test_registry_load_and_instance_cache(tmp_path, monkeypatch):
         config_path,
     )
 
-    registry = ToolRegistry(config_path)
-    registry.load()
+    with patch("zeropoint.registry.importlib.import_module", return_value=mock_mod):
+        registry = ToolRegistry(config_path)
+        registry.load()
 
     assert len(registry) == 2
-    # Both tools must share the same instance
     assert registry._tools["filesystem_read"] is registry._tools["filesystem_list"]
-    # Instance cache must have exactly one entry for this module
     assert len(registry._instances) == 1
 
 
-def test_registry_disabled_module_skipped(tmp_path, monkeypatch):
-    _purge_cached_modules("zeropoint.tools.filesystem")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
+def test_registry_disabled_module_skipped(tmp_path):
+    mock_mod = _make_mock_module("FilesystemTool")
 
     config_path = _make_config(
         {"filesystem": {"enabled": False, "config": {}}},
@@ -141,17 +119,15 @@ def test_registry_disabled_module_skipped(tmp_path, monkeypatch):
         config_path,
     )
 
-    registry = ToolRegistry(config_path)
-    registry.load()
+    with patch("zeropoint.registry.importlib.import_module", return_value=mock_mod):
+        registry = ToolRegistry(config_path)
+        registry.load()
+
     assert len(registry) == 0
 
 
-def test_registry_bad_module_reported(tmp_path, monkeypatch, caplog):
+def test_registry_bad_module_reported(tmp_path, caplog):
     """A tool pointing to a non-existent module must emit a WARNING summary."""
-    _purge_cached_modules("zeropoint.tools.nonexistent_module")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
-
     config_path = _make_config(
         {"nonexistent_module": {"enabled": True, "config": {}}},
         tmp_path,
@@ -162,9 +138,14 @@ def test_registry_bad_module_reported(tmp_path, monkeypatch, caplog):
     )
 
     import logging
-    with caplog.at_level(logging.WARNING):
-        registry = ToolRegistry(config_path)
-        registry.load()
+    # Let import_module raise ImportError for the non-existent module
+    with patch(
+        "zeropoint.registry.importlib.import_module",
+        side_effect=ImportError("No module named 'zeropoint.tools.nonexistent_module'"),
+    ):
+        with caplog.at_level(logging.WARNING):
+            registry = ToolRegistry(config_path)
+            registry.load()
 
     assert len(registry) == 0
     assert "TOOL LOAD FAILURES" in caplog.text
@@ -176,10 +157,8 @@ def test_registry_bad_module_reported(tmp_path, monkeypatch, caplog):
 ###############################################################################
 
 @pytest.mark.asyncio
-async def test_call_unknown_tool(tmp_path, monkeypatch):
-    _purge_cached_modules("zeropoint.tools.filesystem")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
+async def test_call_unknown_tool(tmp_path):
+    mock_mod = _make_mock_module("FilesystemTool")
 
     config_path = _make_config(
         {"filesystem": {"enabled": True, "config": {}}},
@@ -190,8 +169,9 @@ async def test_call_unknown_tool(tmp_path, monkeypatch):
         config_path,
     )
 
-    registry = ToolRegistry(config_path)
-    registry.load()
+    with patch("zeropoint.registry.importlib.import_module", return_value=mock_mod):
+        registry = ToolRegistry(config_path)
+        registry.load()
 
     result = await registry.call("does_not_exist", {})
     assert result["isError"] is True
@@ -199,17 +179,14 @@ async def test_call_unknown_tool(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_call_op_stripping(tmp_path, monkeypatch):
+async def test_call_op_stripping(tmp_path):
     """filesystem_read -> op 'read' must be passed as _op.
 
-    The mock BaseTool.safe_execute always returns isError=False regardless of
-    path, so this test is fully isolated from any production allowed_roots check.
-    We explicitly purge any cached real zeropoint.tools.filesystem module before
-    prepending tmp_path so the registry always loads the mock.
+    importlib.import_module is patched at the registry seam so the real
+    zeropoint.tools.filesystem (with allowed_roots enforcement) is never
+    loaded, regardless of the editable install on sys.path.
     """
-    _purge_cached_modules("zeropoint.tools.filesystem")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
+    mock_mod = _make_mock_module("FilesystemTool")
 
     config_path = _make_config(
         {"filesystem": {"enabled": True, "config": {}}},
@@ -220,8 +197,9 @@ async def test_call_op_stripping(tmp_path, monkeypatch):
         config_path,
     )
 
-    registry = ToolRegistry(config_path)
-    registry.load()
+    with patch("zeropoint.registry.importlib.import_module", return_value=mock_mod):
+        registry = ToolRegistry(config_path)
+        registry.load()
 
     result = await registry.call("filesystem_read", {"path": "/tmp"})
     assert result["isError"] is False
@@ -233,11 +211,9 @@ async def test_call_op_stripping(tmp_path, monkeypatch):
 ###############################################################################
 
 @pytest.mark.asyncio
-async def test_startup_shutdown_called_once_per_instance(tmp_path, monkeypatch):
+async def test_startup_shutdown_called_once_per_instance(tmp_path):
     """startup/shutdown called exactly once per unique instance, not per tool name."""
-    _purge_cached_modules("zeropoint.tools.filesystem")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
+    mock_mod = _make_mock_module("FilesystemTool")
 
     config_path = _make_config(
         {"filesystem": {"enabled": True, "config": {}}},
@@ -251,8 +227,9 @@ async def test_startup_shutdown_called_once_per_instance(tmp_path, monkeypatch):
         config_path,
     )
 
-    registry = ToolRegistry(config_path)
-    registry.load()
+    with patch("zeropoint.registry.importlib.import_module", return_value=mock_mod):
+        registry = ToolRegistry(config_path)
+        registry.load()
 
     startup_count = 0
     shutdown_count = 0
@@ -280,10 +257,8 @@ async def test_startup_shutdown_called_once_per_instance(tmp_path, monkeypatch):
 # ToolRegistry — introspection
 ###############################################################################
 
-def test_list_tools_returns_registered_only(tmp_path, monkeypatch):
-    _purge_cached_modules("zeropoint.tools.filesystem")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    _make_mock_tool_class(tmp_path, "filesystem", "FilesystemTool")
+def test_list_tools_returns_registered_only(tmp_path):
+    mock_mod = _make_mock_module("FilesystemTool")
 
     config_path = _make_config(
         {"filesystem": {"enabled": True, "config": {}}},
@@ -299,8 +274,10 @@ def test_list_tools_returns_registered_only(tmp_path, monkeypatch):
         config_path,
     )
 
-    registry = ToolRegistry(config_path)
-    registry.load()
+    with patch("zeropoint.registry.importlib.import_module", return_value=mock_mod):
+        registry = ToolRegistry(config_path)
+        registry.load()
+
     tools = registry.list_tools()
 
     assert len(tools) == 2
