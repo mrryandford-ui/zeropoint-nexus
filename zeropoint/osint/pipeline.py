@@ -298,7 +298,6 @@ class OSINTPipeline:
     async def gather_port_scan(self, target: str, ports: list[int] | None = None) -> OSINTResult:
         module = "port_scan_active"
         ports = ports or [22, 80, 443, 8080, 8443]
-        loop = asyncio.get_event_loop()
         open_ports = []
 
         async def _probe(port: int):
