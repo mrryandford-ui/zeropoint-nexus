@@ -3,15 +3,15 @@ ZeroPoint OSINT Pipeline
 Passive and active intelligence gathering: DNS, WHOIS, IP geo,
 subdomain enumeration, certificate transparency, and social footprint.
 """
+
 from __future__ import annotations
 
 import asyncio
 import ipaddress
-import json
 import logging
 import socket
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import aiohttp
@@ -24,7 +24,7 @@ class OSINTResult:
     target: str
     module: str
     data: dict[str, Any]
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     error: str | None = None
 
     def to_dict(self) -> dict:
@@ -78,7 +78,9 @@ class OSINTPipeline:
         if active:
             tasks += [
                 self.gather_subdomains(target),
-                self.gather_port_scan(target, ports=[21, 22, 23, 25, 53, 80, 443, 3306, 5432, 8080, 8443]),
+                self.gather_port_scan(
+                    target, ports=[21, 22, 23, 25, 53, 80, 443, 3306, 5432, 8080, 8443]
+                ),
             ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -94,7 +96,7 @@ class OSINTPipeline:
             "active_mode": active,
             "module_count": len(output),
             "results": output,
-            "run_at": datetime.now(timezone.utc).isoformat(),
+            "run_at": datetime.now(UTC).isoformat(),
         }
 
     # ------------------------------------------------------------------
@@ -110,8 +112,10 @@ class OSINTPipeline:
             for rtype in ("A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA"):
                 try:
                     import dns.resolver  # type: ignore
+
                     answers = await loop.run_in_executor(
-                        None, lambda r=rtype: dns.resolver.resolve(target, r, raise_on_no_answer=False)
+                        None,
+                        lambda r=rtype: dns.resolver.resolve(target, r, raise_on_no_answer=False),
                     )
                     records[rtype] = [str(a) for a in answers]
                 except Exception:
@@ -123,7 +127,9 @@ class OSINTPipeline:
             try:
                 loop = asyncio.get_event_loop()
                 addrs = await loop.run_in_executor(None, socket.gethostbyname_ex, target)
-                return OSINTResult(target, module, {"A": addrs[2], "note": "dnspython not installed"})
+                return OSINTResult(
+                    target, module, {"A": addrs[2], "note": "dnspython not installed"}
+                )
             except Exception as exc:
                 return OSINTResult(target, module, {}, error=str(exc))
         except Exception as exc:
@@ -137,6 +143,7 @@ class OSINTPipeline:
         module = "whois"
         try:
             import whois as pywhois  # type: ignore
+
             loop = asyncio.get_event_loop()
             w = await loop.run_in_executor(None, pywhois.whois, target)
             data = {k: str(v) for k, v in (w or {}).items() if v}
@@ -159,7 +166,9 @@ class OSINTPipeline:
 
             # Skip private IPs
             if ipaddress.ip_address(ip).is_private:
-                return OSINTResult(target, module, {"ip": ip, "note": "Private IP — skipped geo lookup"})
+                return OSINTResult(
+                    target, module, {"ip": ip, "note": "Private IP — skipped geo lookup"}
+                )
 
             assert self._session
             async with self._session.get(f"http://ip-api.com/json/{ip}?fields=66846719") as resp:
@@ -193,11 +202,15 @@ class OSINTPipeline:
                 if issuer:
                     issuers.add(str(issuer))
 
-            return OSINTResult(target, module, {
-                "subdomains_found": sorted(domains),
-                "cert_count": len(raw or []),
-                "unique_subdomains": len(domains),
-            })
+            return OSINTResult(
+                target,
+                module,
+                {
+                    "subdomains_found": sorted(domains),
+                    "cert_count": len(raw or []),
+                    "unique_subdomains": len(domains),
+                },
+            )
         except Exception as exc:
             return OSINTResult(target, module, {}, error=str(exc))
 
@@ -219,8 +232,12 @@ class OSINTPipeline:
                         "server": resp.headers.get("Server", ""),
                         "x_powered_by": resp.headers.get("X-Powered-By", ""),
                         "x_frame_options": resp.headers.get("X-Frame-Options", ""),
-                        "content_security_policy": resp.headers.get("Content-Security-Policy", "")[:200],
-                        "strict_transport_security": resp.headers.get("Strict-Transport-Security", ""),
+                        "content_security_policy": resp.headers.get("Content-Security-Policy", "")[
+                            :200
+                        ],
+                        "strict_transport_security": resp.headers.get(
+                            "Strict-Transport-Security", ""
+                        ),
                         "set_cookie": "present" if "Set-Cookie" in resp.headers else "absent",
                     }
                 break
@@ -233,12 +250,32 @@ class OSINTPipeline:
     # Subdomain enumeration (active — wordlist based)
     # ------------------------------------------------------------------
 
-    async def gather_subdomains(self, target: str, wordlist: list[str] | None = None) -> OSINTResult:
+    async def gather_subdomains(
+        self, target: str, wordlist: list[str] | None = None
+    ) -> OSINTResult:
         module = "subdomains_active"
         common = wordlist or [
-            "www", "mail", "ftp", "smtp", "api", "dev", "staging", "test",
-            "admin", "vpn", "portal", "app", "cdn", "static", "img",
-            "remote", "citrix", "webmail", "secure", "shop", "blog",
+            "www",
+            "mail",
+            "ftp",
+            "smtp",
+            "api",
+            "dev",
+            "staging",
+            "test",
+            "admin",
+            "vpn",
+            "portal",
+            "app",
+            "cdn",
+            "static",
+            "img",
+            "remote",
+            "citrix",
+            "webmail",
+            "secure",
+            "shop",
+            "blog",
         ]
         found = []
         loop = asyncio.get_event_loop()
@@ -266,9 +303,7 @@ class OSINTPipeline:
 
         async def _probe(port: int):
             try:
-                _, writer = await asyncio.wait_for(
-                    asyncio.open_connection(target, port), timeout=2
-                )
+                _, writer = await asyncio.wait_for(asyncio.open_connection(target, port), timeout=2)
                 writer.close()
                 try:
                     await writer.wait_closed()
@@ -279,9 +314,12 @@ class OSINTPipeline:
                 pass
 
         await asyncio.gather(*[_probe(p) for p in ports])
-        return OSINTResult(target, module, {
-            "open_ports": sorted(open_ports),
-            "scanned": len(ports),
-            "note": "TCP connect scan only",
-        })
-
+        return OSINTResult(
+            target,
+            module,
+            {
+                "open_ports": sorted(open_ports),
+                "scanned": len(ports),
+                "note": "TCP connect scan only",
+            },
+        )

@@ -3,32 +3,32 @@ ZeroPoint Investigations Agent
 Case management, evidence collection, and link analysis
 for structured OSINT investigations.
 """
+
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger("zeropoint.osint.investigations")
 
 
 class EvidenceType(str, Enum):
-    DOMAIN      = "domain"
-    IP          = "ip"
-    EMAIL       = "email"
-    PERSON      = "person"
-    ORGANIZATION= "organization"
-    PHONE       = "phone"
-    USERNAME    = "username"
-    URL         = "url"
-    HASH        = "hash"
-    FILE        = "file"
-    NOTE        = "note"
+    DOMAIN = "domain"
+    IP = "ip"
+    EMAIL = "email"
+    PERSON = "person"
+    ORGANIZATION = "organization"
+    PHONE = "phone"
+    USERNAME = "username"
+    URL = "url"
+    HASH = "hash"
+    FILE = "file"
+    NOTE = "note"
 
 
 @dataclass
@@ -37,11 +37,11 @@ class Evidence:
     etype: EvidenceType
     value: str
     source: str
-    confidence: float          # 0.0 – 1.0
+    confidence: float  # 0.0 – 1.0
     tags: list[str] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
-    added_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    linked_to: list[str] = field(default_factory=list)   # other evidence_ids
+    added_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    linked_to: list[str] = field(default_factory=list)  # other evidence_ids
 
     def to_dict(self) -> dict:
         return {
@@ -62,22 +62,24 @@ class Case:
     case_id: str
     title: str
     description: str
-    status: str = "open"          # open | active | closed | archived
-    priority: str = "medium"      # low | medium | high | critical
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    status: str = "open"  # open | active | closed | archived
+    priority: str = "medium"  # low | medium | high | critical
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     evidence: dict[str, Evidence] = field(default_factory=dict)
     timeline: list[dict] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
 
     def add_event(self, actor: str, action: str, detail: str = "") -> None:
-        self.timeline.append({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "actor": actor,
-            "action": action,
-            "detail": detail,
-        })
-        self.updated_at = datetime.now(timezone.utc)
+        self.timeline.append(
+            {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "actor": actor,
+                "action": action,
+                "detail": detail,
+            }
+        )
+        self.updated_at = datetime.now(UTC)
 
     def to_dict(self, include_evidence: bool = True) -> dict:
         d = {
@@ -91,7 +93,7 @@ class Case:
             "evidence_count": len(self.evidence),
             "timeline_entries": len(self.timeline),
             "tags": self.tags,
-            "timeline": self.timeline[-20:],   # last 20 events
+            "timeline": self.timeline[-20:],  # last 20 events
         }
         if include_evidence:
             d["evidence"] = {k: v.to_dict() for k, v in self.evidence.items()}
@@ -158,8 +160,10 @@ class InvestigationsAgent:
         cases = self._cases.values()
         if status:
             cases = [c for c in cases if c.status == status]
-        return [c.to_dict(include_evidence=False) for c in
-                sorted(cases, key=lambda c: c.updated_at, reverse=True)]
+        return [
+            c.to_dict(include_evidence=False)
+            for c in sorted(cases, key=lambda c: c.updated_at, reverse=True)
+        ]
 
     # ------------------------------------------------------------------
     # Evidence management
@@ -220,7 +224,8 @@ class InvestigationsAgent:
             return []
         q = query.lower()
         return [
-            ev.to_dict() for ev in case.evidence.values()
+            ev.to_dict()
+            for ev in case.evidence.values()
             if q in ev.value.lower()
             or q in ev.source.lower()
             or any(q in t.lower() for t in ev.tags)
@@ -241,12 +246,14 @@ class InvestigationsAgent:
         seen_edges: set[frozenset] = set()
 
         for ev in case.evidence.values():
-            nodes.append({
-                "id": ev.evidence_id,
-                "type": ev.etype,
-                "label": ev.value[:40],
-                "confidence": ev.confidence,
-            })
+            nodes.append(
+                {
+                    "id": ev.evidence_id,
+                    "type": ev.etype,
+                    "label": ev.value[:40],
+                    "confidence": ev.confidence,
+                }
+            )
             for linked in ev.linked_to:
                 pair = frozenset([ev.evidence_id, linked])
                 if pair not in seen_edges:
@@ -279,11 +286,12 @@ class InvestigationsAgent:
         total_links = sum(len(ev.linked_to) for ev in case.evidence.values()) // 2
         avg_confidence = (
             sum(ev.confidence for ev in case.evidence.values()) / len(case.evidence)
-            if case.evidence else 0.0
+            if case.evidence
+            else 0.0
         )
 
         report = {
-            "report_generated": datetime.now(timezone.utc).isoformat(),
+            "report_generated": datetime.now(UTC).isoformat(),
             "case": case.to_dict(include_evidence=False),
             "summary": {
                 "total_evidence": len(case.evidence),
@@ -341,4 +349,3 @@ class InvestigationsAgent:
             except Exception as exc:
                 logger.warning("Could not load %s: %s", path, exc)
         return loaded
-

@@ -3,28 +3,28 @@ ZeroPoint Device Recovery Workflow
 Automated Android device recovery: bootloop, bricked state, factory reset,
 ADB recovery mode, and sideload operations.
 """
+
 from __future__ import annotations
 
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger("zeropoint.device_recovery")
 
 
 class DeviceState(str, Enum):
-    UNKNOWN      = "unknown"
-    ONLINE       = "online"
-    OFFLINE      = "offline"
-    BOOTLOOP     = "bootloop"
-    FASTBOOT     = "fastboot"
-    RECOVERY     = "recovery"
-    SIDELOAD     = "sideload"
-    BRICKED      = "bricked"
+    UNKNOWN = "unknown"
+    ONLINE = "online"
+    OFFLINE = "offline"
+    BOOTLOOP = "bootloop"
+    FASTBOOT = "fastboot"
+    RECOVERY = "recovery"
+    SIDELOAD = "sideload"
+    BRICKED = "bricked"
 
 
 @dataclass
@@ -33,7 +33,7 @@ class RecoveryStep:
     description: str
     success: bool = False
     output: str = ""
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 @dataclass
@@ -45,10 +45,12 @@ class RecoverySession:
     steps: list[RecoveryStep] = field(default_factory=list)
     completed: bool = False
     success: bool = False
-    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime | None = None
 
-    def add_step(self, name: str, description: str, success: bool, output: str = "") -> RecoveryStep:
+    def add_step(
+        self, name: str, description: str, success: bool, output: str = ""
+    ) -> RecoveryStep:
         step = RecoveryStep(name=name, description=description, success=success, output=output)
         self.steps.append(step)
         logger.info("[%s] Step '%s': %s", self.session_id, name, "✓" if success else "✗")
@@ -98,14 +100,18 @@ class DeviceRecoveryWorkflow:
     # ADB / fastboot runners
     # ------------------------------------------------------------------
 
-    async def _adb(self, args: list[str], serial: str | None = None, timeout: int = 30) -> tuple[str, int]:
+    async def _adb(
+        self, args: list[str], serial: str | None = None, timeout: int = 30
+    ) -> tuple[str, int]:
         cmd = ["adb"]
         if serial:
             cmd += ["-s", serial]
         cmd += args
         return await self._run(cmd, timeout)
 
-    async def _fastboot(self, args: list[str], serial: str | None = None, timeout: int = 60) -> tuple[str, int]:
+    async def _fastboot(
+        self, args: list[str], serial: str | None = None, timeout: int = 60
+    ) -> tuple[str, int]:
         cmd = ["fastboot"]
         if serial:
             cmd += ["-s", serial]
@@ -122,7 +128,7 @@ class DeviceRecoveryWorkflow:
             )
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             return out.decode(errors="replace").strip(), proc.returncode or 0
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return f"Command timed out after {timeout}s: {' '.join(cmd)}", -1
         except Exception as exc:
             return str(exc), -1
@@ -135,8 +141,12 @@ class DeviceRecoveryWorkflow:
         # Check ADB
         out, rc = await self._adb(["get-state"], serial=serial, timeout=5)
         if rc == 0:
-            state_map = {"device": DeviceState.ONLINE, "recovery": DeviceState.RECOVERY,
-                         "sideload": DeviceState.SIDELOAD, "bootloader": DeviceState.FASTBOOT}
+            state_map = {
+                "device": DeviceState.ONLINE,
+                "recovery": DeviceState.RECOVERY,
+                "sideload": DeviceState.SIDELOAD,
+                "bootloader": DeviceState.FASTBOOT,
+            }
             return state_map.get(out.strip(), DeviceState.UNKNOWN)
 
         # Check fastboot
@@ -150,7 +160,9 @@ class DeviceRecoveryWorkflow:
     # Session factory
     # ------------------------------------------------------------------
 
-    def _new_session(self, serial: str, initial: DeviceState, target: DeviceState) -> RecoverySession:
+    def _new_session(
+        self, serial: str, initial: DeviceState, target: DeviceState
+    ) -> RecoverySession:
         self._counter += 1
         sid = f"REC-{self._counter:04d}"
         session = RecoverySession(sid, serial, initial, target)
@@ -177,7 +189,7 @@ class DeviceRecoveryWorkflow:
 
         session.success = (await self.detect_state(serial)) == DeviceState.ONLINE
         session.completed = True
-        session.finished_at = datetime.now(timezone.utc)
+        session.finished_at = datetime.now(UTC)
         return session
 
     async def reboot_to_recovery(self, serial: str) -> RecoverySession:
@@ -190,13 +202,14 @@ class DeviceRecoveryWorkflow:
         await asyncio.sleep(8)
         new_state = await self.detect_state(serial)
         session.add_step(
-            "verify_recovery", "Verifying recovery mode",
+            "verify_recovery",
+            "Verifying recovery mode",
             new_state == DeviceState.RECOVERY,
             f"State: {new_state}",
         )
         session.success = new_state == DeviceState.RECOVERY
         session.completed = True
-        session.finished_at = datetime.now(timezone.utc)
+        session.finished_at = datetime.now(UTC)
         return session
 
     async def reboot_to_fastboot(self, serial: str) -> RecoverySession:
@@ -215,7 +228,7 @@ class DeviceRecoveryWorkflow:
         new_state = await self.detect_state(serial)
         session.success = new_state == DeviceState.FASTBOOT
         session.completed = True
-        session.finished_at = datetime.now(timezone.utc)
+        session.finished_at = datetime.now(UTC)
         return session
 
     async def sideload_ota(self, serial: str, ota_zip_path: str) -> RecoverySession:
@@ -223,7 +236,9 @@ class DeviceRecoveryWorkflow:
         session = self._new_session(serial, state, DeviceState.ONLINE)
 
         if not Path(ota_zip_path).exists():
-            session.add_step("check_ota", "Verify OTA zip exists", False, f"Not found: {ota_zip_path}")
+            session.add_step(
+                "check_ota", "Verify OTA zip exists", False, f"Not found: {ota_zip_path}"
+            )
             session.completed = True
             return session
 
@@ -242,7 +257,7 @@ class DeviceRecoveryWorkflow:
 
         session.success = rc == 0
         session.completed = True
-        session.finished_at = datetime.now(timezone.utc)
+        session.finished_at = datetime.now(UTC)
         return session
 
     async def factory_reset(self, serial: str, confirmed: bool = False) -> RecoverySession:
@@ -252,8 +267,10 @@ class DeviceRecoveryWorkflow:
 
         if not confirmed:
             session.add_step(
-                "safety_gate", "Factory reset requires confirmed=True",
-                False, "Aborted — confirmation not given."
+                "safety_gate",
+                "Factory reset requires confirmed=True",
+                False,
+                "Aborted — confirmation not given.",
             )
             session.completed = True
             return session
@@ -277,7 +294,7 @@ class DeviceRecoveryWorkflow:
 
         session.success = rc == 0
         session.completed = True
-        session.finished_at = datetime.now(timezone.utc)
+        session.finished_at = datetime.now(UTC)
         return session
 
     async def adb_reconnect(self, serial: str) -> RecoverySession:
@@ -287,9 +304,9 @@ class DeviceRecoveryWorkflow:
 
         steps = [
             (["disconnect", serial], "Disconnect device"),
-            (["kill-server"],        "Kill ADB server"),
-            (["start-server"],       "Start ADB server"),
-            (["connect", serial],    "Reconnect device"),
+            (["kill-server"], "Kill ADB server"),
+            (["start-server"], "Start ADB server"),
+            (["connect", serial], "Reconnect device"),
         ]
         for args, label in steps:
             out, rc = await self._adb(args, timeout=15)
@@ -300,7 +317,7 @@ class DeviceRecoveryWorkflow:
         final_state = await self.detect_state(serial)
         session.success = final_state == DeviceState.ONLINE
         session.completed = True
-        session.finished_at = datetime.now(timezone.utc)
+        session.finished_at = datetime.now(UTC)
         return session
 
     # ------------------------------------------------------------------
@@ -312,5 +329,7 @@ class DeviceRecoveryWorkflow:
         return s.to_dict() if s else None
 
     def list_sessions(self) -> list[dict]:
-        return [s.to_dict() for s in sorted(self._sessions.values(), key=lambda s: s.started_at, reverse=True)]
-
+        return [
+            s.to_dict()
+            for s in sorted(self._sessions.values(), key=lambda s: s.started_at, reverse=True)
+        ]

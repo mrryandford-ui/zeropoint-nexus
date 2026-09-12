@@ -2,16 +2,14 @@
 ZeroPoint IT Support Agent
 Automated triage, diagnosis, and remediation for common IT issues.
 """
+
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Any
 
 logger = logging.getLogger("zeropoint.it_support")
 
@@ -38,7 +36,7 @@ class Ticket:
     description: str
     severity: Severity = Severity.MEDIUM
     status: TicketStatus = TicketStatus.OPEN
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     resolved_at: datetime | None = None
     steps_taken: list[str] = field(default_factory=list)
     resolution: str = ""
@@ -71,7 +69,7 @@ class ITSupportAgent:
 
     KNOWN_ISSUES = {
         "no_network": ["ping", "dns", "gateway", "network", "connectivity", "offline"],
-        "disk_full":  ["disk", "space", "full", "storage", "no space left"],
+        "disk_full": ["disk", "space", "full", "storage", "no space left"],
         "service_down": ["service", "daemon", "crash", "stopped", "failed", "dead"],
         "high_cpu": ["cpu", "load", "slow", "hung", "freeze", "100%"],
         "high_memory": ["memory", "ram", "oom", "out of memory", "swap"],
@@ -138,11 +136,11 @@ class ITSupportAgent:
 
     async def _diagnose(self, issue_type: str, device_id: str) -> dict:
         handlers = {
-            "no_network":   self._diag_network,
-            "disk_full":    self._diag_disk,
+            "no_network": self._diag_network,
+            "disk_full": self._diag_disk,
             "service_down": self._diag_services,
-            "high_cpu":     self._diag_cpu,
-            "high_memory":  self._diag_memory,
+            "high_cpu": self._diag_cpu,
+            "high_memory": self._diag_memory,
             "auth_failure": self._diag_auth,
             "device_offline": self._diag_device,
         }
@@ -205,7 +203,7 @@ class ITSupportAgent:
     async def _diag_generic(self, _: str) -> dict:
         out, _ = await self._run(["uptime"])
         mem, _ = await self._run(["free", "-h"])
-        df, _  = await self._run(["df", "-h", "/"])
+        df, _ = await self._run(["df", "-h", "/"])
         return {"uptime": out, "memory": mem, "disk_root": df}
 
     # ------------------------------------------------------------------
@@ -237,9 +235,7 @@ class ITSupportAgent:
 
         elif issue_type == "high_memory":
             out, rc = await self._run(["sync"])
-            out2, _ = await self._run(
-                ["bash", "-c", "echo 3 > /proc/sys/vm/drop_caches"]
-            )
+            out2, _ = await self._run(["bash", "-c", "echo 3 > /proc/sys/vm/drop_caches"])
             actions.append("Synced and dropped caches.")
 
         if not actions:
@@ -247,9 +243,8 @@ class ITSupportAgent:
             ticket.status = TicketStatus.ESCALATED
         else:
             ticket.status = TicketStatus.RESOLVED
-            ticket.resolved_at = datetime.now(timezone.utc)
+            ticket.resolved_at = datetime.now(UTC)
             ticket.resolution = "; ".join(actions)
 
         ticket.steps_taken.extend(actions)
         return {"actions": actions, "status": ticket.status}
-
