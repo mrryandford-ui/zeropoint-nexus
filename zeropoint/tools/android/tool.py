@@ -6,7 +6,6 @@ Registered tool names: android_tap, android_swipe, android_input_text,
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +26,10 @@ class AndroidTool(BaseTool):
 
     async def startup(self) -> None:
         try:
+            import os
+
             from android.camnet_controller import CamNetController
-            import yaml, os
+
             cfg_path = os.environ.get(
                 "MCP_CONFIG", "/workspace/zeropoint/config/mcp_server_config.yaml"
             )
@@ -52,12 +53,12 @@ class AndroidTool(BaseTool):
     async def execute(self, params: dict[str, Any]) -> ToolResult:
         op = params.pop("_op", "tap")
         dispatch = {
-            "tap":              self._tap,
-            "swipe":            self._swipe,
-            "input_text":       self._input_text,
-            "camera_capture":   self._camera_capture,
-            "camnet_status":    self._camnet_status,
-            "camnet_sync":      self._camnet_sync,
+            "tap": self._tap,
+            "swipe": self._swipe,
+            "input_text": self._input_text,
+            "camera_capture": self._camera_capture,
+            "camnet_status": self._camnet_status,
+            "camnet_sync": self._camnet_sync,
         }
         handler = dispatch.get(op)
         if handler is None:
@@ -119,7 +120,9 @@ class AndroidTool(BaseTool):
         self._need_controller()
         mode = params.get("mode", "photo")
         if mode not in ("photo", "screencap", "burst"):
-            raise ToolError(f"Invalid mode '{mode}'. Use photo, screencap, or burst.", code="BAD_PARAM")
+            raise ToolError(
+                f"Invalid mode '{mode}'. Use photo, screencap, or burst.", code="BAD_PARAM"
+            )
 
         results = await self._controller.capture_all(
             device_ids=params.get("device_ids"),
@@ -161,4 +164,3 @@ class AndroidTool(BaseTool):
                 "CamNet controller is not available. Check device config and uiautomator2 install.",
                 code="CONTROLLER_UNAVAILABLE",
             )
-

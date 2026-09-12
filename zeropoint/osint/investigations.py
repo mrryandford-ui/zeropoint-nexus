@@ -11,13 +11,13 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 
 logger = logging.getLogger("zeropoint.osint.investigations")
 
 
-class EvidenceType(str, Enum):
+class EvidenceType(StrEnum):
     DOMAIN = "domain"
     IP = "ip"
     EMAIL = "email"

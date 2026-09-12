@@ -9,19 +9,19 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 
 logger = logging.getLogger("zeropoint.it_support")
 
 
-class Severity(str, Enum):
+class Severity(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
     CRITICAL = "critical"
 
 
-class TicketStatus(str, Enum):
+class TicketStatus(StrEnum):
     OPEN = "open"
     TRIAGING = "triaging"
     IN_PROGRESS = "in_progress"

@@ -10,13 +10,13 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 
 logger = logging.getLogger("zeropoint.device_recovery")
 
 
-class DeviceState(str, Enum):
+class DeviceState(StrEnum):
     UNKNOWN = "unknown"
     ONLINE = "online"
     OFFLINE = "offline"
