@@ -1,6 +1,8 @@
-# ZeroPoint MCP
+# ZeroPoint Nexus
 
-ZeroPoint MCP is a private two-node AI/tooling cluster for local system work, analysis, and automation.
+ZeroPoint Nexus is a distributed AI relay grid — a private multi-node
+cluster for local systems work, security tooling, OSINT, IT
+automation, and device control, exposed to AI assistants via MCP.
 
 ## Goal
 

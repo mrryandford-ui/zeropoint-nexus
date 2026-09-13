@@ -1,4 +1,4 @@
-# ZeroPoint Cluster Setup & Connection Guide
+# ZeroPoint Nexus Cluster Setup & Connection Guide
 
 ## Current Cluster Status Summary
 

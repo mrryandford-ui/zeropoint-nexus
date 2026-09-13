@@ -1,4 +1,4 @@
-# ZeroPoint MCP Project Scope & Handoff
+# ZeroPoint Nexus Project Scope & Handoff
 
 Last updated: 2026-09-11 (MCP/autostart workspace handoff)
 

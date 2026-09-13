@@ -1,4 +1,4 @@
-# ZeroPoint MCP - Complete System Overview
+# ZeroPoint Nexus - Complete System Overview
 
 ## 🎯 Executive Summary
 
