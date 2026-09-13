@@ -46,7 +46,10 @@ The authoritative next step is to commit this focused set, push it to `origin/ma
 
 ### ZERO-FLD health verification
 
-- In progress; the repository definition and read-only health result will be appended after the Part B check.
+- ZERO-FLD is the remote backend/head node defined in `cluster_registry.json` at `192.168.0.140`, with Ray on `6379`, MCP on `8765`, and identity on `8766`.
+- Ran the repository-defined read-only check: `verify_cluster_connection.ps1 -Verify`.
+- Result: Ray head `6379` CLOSED, MCP `8765` CLOSED, and identity `8766` CLOSED. The verifier reported `ZERO-FLD is not responding`.
+- No remote connection or activation attempt was made. The documented next action is to verify ZERO-FLD is running and, if appropriate, run `activate_cluster_head.ps1 -Activate` on that machine.
 
 ## 1) Mission
 
