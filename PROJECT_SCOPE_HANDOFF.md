@@ -50,6 +50,8 @@ The authoritative next step is to commit this focused set, push it to `origin/ma
 - Ran the repository-defined read-only check: `verify_cluster_connection.ps1 -Verify`.
 - Result: Ray head `6379` CLOSED, MCP `8765` CLOSED, and identity `8766` CLOSED. The verifier reported `ZERO-FLD is not responding`.
 - No remote connection or activation attempt was made. The documented next action is to verify ZERO-FLD is running and, if appropriate, run `activate_cluster_head.ps1 -Activate` on that machine.
+- Follow-on verification after services were started directly on ZERO-FLD through its local console/VS Code session: Ray `6379`, MCP `8765`, and identity `8766` all reported OPEN/reachable from ZERO-DEV.
+- The confirmed root cause was service startup/availability: the processes were not running/listening, rather than a LAN, firewall-profile, or Tailscale routing failure.
 
 ## 1) Mission
 
