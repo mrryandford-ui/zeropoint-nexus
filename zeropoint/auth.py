@@ -27,10 +27,11 @@ logger = logging.getLogger(__name__)
 # Config
 ###############################################################################
 
+
 @dataclass
 class AuthConfig:
     enabled: bool = True
-    method: str = "bearer_token"    # bearer_token | none
+    method: str = "bearer_token"  # bearer_token | none
     token_env: str = "MCP_AUTH_TOKEN"
     rate_limit_per_minute: int = 120
 
@@ -38,6 +39,7 @@ class AuthConfig:
 ###############################################################################
 # BearerTokenAuth
 ###############################################################################
+
 
 class BearerTokenAuth:
     """
@@ -47,11 +49,15 @@ class BearerTokenAuth:
     Comparison is constant-time to prevent timing attacks.
     """
 
+    _SWEEP_INTERVAL = 500
+    _MAX_TRACKED_IPS = 10_000
+
     def __init__(self, cfg: AuthConfig):
         self.cfg = cfg
         self._token: str | None = None
         self._token_hash: bytes | None = None
         self._failed_attempts: dict[str, list[float]] = {}  # ip -> timestamps
+        self._failure_count = 0
         if cfg.enabled:
             self._load_token()
 
@@ -63,13 +69,10 @@ class BearerTokenAuth:
         raw = os.environ.get(self.cfg.token_env, "").strip()
         if not raw:
             logger.critical(
-                "Auth is ENABLED but %s is not set. "
-                "Set the env var or disable auth in config.",
+                "Auth is ENABLED but %s is not set. " "Set the env var or disable auth in config.",
                 self.cfg.token_env,
             )
-            raise RuntimeError(
-                f"Missing required env var: {self.cfg.token_env}"
-            )
+            raise RuntimeError(f"Missing required env var: {self.cfg.token_env}")
         # Store hash only — never keep the plaintext in memory longer than needed
         self._token_hash = hashlib.sha256(raw.encode()).digest()
         logger.info("Auth token loaded from env var '%s'.", self.cfg.token_env)
@@ -127,12 +130,46 @@ class BearerTokenAuth:
         window = 60.0
         attempts = self._failed_attempts.get(ip, [])
         recent = [t for t in attempts if now - t < window]
-        self._failed_attempts[ip] = recent
+        if recent:
+            self._failed_attempts[ip] = recent
+        else:
+            self._failed_attempts.pop(ip, None)
         limit = self.cfg.rate_limit_per_minute // 10  # 10% of normal limit for failures
         return len(recent) >= limit
 
     def _record_failure(self, ip: str) -> None:
         self._failed_attempts.setdefault(ip, []).append(time.monotonic())
+        self._failure_count += 1
+        if self._failure_count >= self._SWEEP_INTERVAL:
+            self._sweep_stale_entries()
+            self._failure_count = 0
+
+    def _sweep_stale_entries(self) -> None:
+        """Remove stale rate-limit entries and enforce the tracker size cap."""
+        now = time.monotonic()
+        window = 60.0
+        stale_ips = [
+            ip
+            for ip, timestamps in self._failed_attempts.items()
+            if not any(now - timestamp < window for timestamp in timestamps)
+        ]
+        for ip in stale_ips:
+            del self._failed_attempts[ip]
+
+        if len(self._failed_attempts) > self._MAX_TRACKED_IPS:
+            by_recency = sorted(
+                self._failed_attempts.items(),
+                key=lambda item: max(item[1]) if item[1] else 0.0,
+            )
+            overflow = len(self._failed_attempts) - self._MAX_TRACKED_IPS
+            for ip, _ in by_recency[:overflow]:
+                del self._failed_attempts[ip]
+
+        logger.debug(
+            "Auth: swept rate-limit tracker — %d stale IPs removed, %d tracked.",
+            len(stale_ips),
+            len(self._failed_attempts),
+        )
 
     # ------------------------------------------------------------------
     # Token generation helper (used in dev_start.sh / first-run)
@@ -147,6 +184,7 @@ class BearerTokenAuth:
 ###############################################################################
 # Factory
 ###############################################################################
+
 
 def build_auth(config: dict[str, Any]) -> BearerTokenAuth | None:
     """
@@ -163,4 +201,3 @@ def build_auth(config: dict[str, Any]) -> BearerTokenAuth | None:
         logger.info("Auth is DISABLED — all connections accepted.")
         return None
     return BearerTokenAuth(auth_cfg)
-
