@@ -242,3 +242,33 @@ Phase C early progress:
   - `zeropoint-control auto recovery-plan`
   - `zeropoint-control auto recovery-run`
 - Added unit coverage in [test_autonomous_mode.py](C:/Users/zeroi/Downloads/zeropoint-mcp/tests/unit/test_autonomous_mode.py).
+
+## Current Workspace Handoff - 2026-09-13 (continued)
+
+### ZERO-FLD sync gap discovered
+
+- ZERO-FLD's checkout was found to be 29 commits behind `origin/main`, still running the malformed `control_plane.control_plane.control_plane` import that was fixed on ZERO-DEV in commit `aa51ade`.
+- ZERO-FLD has 0 local-only commits but 4 uncommitted local file modifications (`.vscode/mcp.json`, `dev_start.ps1`, `scripts/run_cluster_healthcheck.cmd`, `setup_autostart.ps1`) containing genuine fixes (dynamic `$PSScriptRoot` path resolution, corrected Ray client port `--ray-client-server-port=10001`).
+- Upstream (`origin/main`) independently fixed the same stale-path problem in commits `22f0166` and `4ece177` for those same 4 files, in some respects more completely (legacy startup-file cleanup, `%~dp0` relative resolution). ZERO-FLD's local `dev_start.ps1` fix adds one genuine improvement not present upstream: `--ray-client-server-port=10001`, which `verify_cluster_connection.ps1` already expects to exist.
+- `mcp.json`'s ZERO-FLD-local switch to `stdio` transport (vs. upstream's documented HTTP transport with bearer-token prompt) remains unexplained by any doc found so far; working theory is it avoids an interactive OAuth prompt on a machine with no one present to answer it, but this is unconfirmed.
+- Reconciliation plan (staged, not yet executed): rescue the Ray-client-port addition, take upstream's versions for the other 3 files, resolve `mcp.json` by explicit decision rather than blind merge, then pull remaining commits, then repo-wide fix the ~14 other scripts still referencing the stale `C:\Users\zeroi\Downloads\zeropoint-mcp` path.
+
+### Broken auto-start root cause found
+
+- `ZeroPoint-Cluster-Healthcheck` scheduled task on ZERO-FLD is enabled, runs as SYSTEM every 15 minutes, and has been failing (`LastTaskResult: 1`) continuously.
+- Task XML confirms its action is a malformed/truncated command: `PowerShell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command \` with no script reference after the trailing backslash.
+- This means auto-start genuinely existed and fires on schedule, but cannot launch anything — not a missing mechanism, a corrupted registration.
+- Fix requires unregistering and re-registering the task via the repo's own `setup_cluster_automation.ps1` / `install_autostart_watchdog.ps1`, after the stale-path repair above.
+
+### Ray-actors deletion safety re-confirmed
+
+- Investigated whether commit `aa51ade`'s deletion of `zeropoint/ray_actors/ray_actors/` conflicts with a documented "parity namespace" design note elsewhere in this file (see Phase C notes below: "Both `zeropoint/pentest/` and `zeropoint/pentest/pentest/` maintained to handle Ray worker import ambiguities").
+- That note explicitly and only names `zeropoint/pentest/pentest/` — never `ray_actors` or `control_plane`. `zeropoint/pentest/pentest/` remains fully intact and was not touched by any work this session.
+- Read `zeropoint/ray_actors/camnet_actor.py` directly: `@ray.remote`-decorated classes resolve via standard Python module import (`zeropoint.ray_actors.camnet_actor.CamNetActor`) with no dependency on any nested duplicate folder.
+- Verdict: the `aa51ade` cleanup remains safe. No revert needed.
+
+### New capability: live MCP filesystem access
+
+- A ZeroPoint-Nexus MCP connector was successfully connected (via Tailscale bridging) giving direct `filesystem_read`/`write`/`list` access scoped to `C:\ZeroPoint` on ZERO-DEV only (confirmed: `Z:\` and `U:\` mappings to ZERO-FLD are outside the allowed root and return `PATH_DENIED`).
+- Caveat found: some file types (e.g. `.ps1`) return base64-encoded content rather than plain text; a manual reconstruction attempt for `activate_cluster_head.ps1` produced a byte-count mismatch (5342 vs actual 5451 bytes) and was correctly discarded rather than written back, to avoid silent corruption. Direct writes are only being used for confirmed plain-text-returning files (`.md`, this file). `.ps1` edits continue to route through VS Code Copilot with explicit diffs.
+- Confirmed ZERO-DEV's own `activate_cluster_head.ps1` has the identical stale path as ZERO-FLD's copy (expected, same tracked file); fix is the same `$PSScriptRoot` pattern already validated in the rescued `dev_start.ps1` patch.
