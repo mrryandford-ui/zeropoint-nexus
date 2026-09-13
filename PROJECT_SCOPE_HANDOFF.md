@@ -20,6 +20,34 @@ Last updated: 2026-09-11 (MCP/autostart workspace handoff)
 
 The authoritative next step is to commit this focused set, push it to `origin/main`, and then verify the clean worktree.
 
+## Current Workspace Handoff - 2026-09-12
+
+### Control-plane cleanup
+
+- Fixed `zeropoint/control_plane/__init__.py` and `zeropoint/control_plane/cli.py`, which imported `ZeroPointControlPlane` through the malformed path `zeropoint.control_plane.control_plane.control_plane`.
+- Verified direct imports before and after deleting the stale nested `zeropoint/control_plane/control_plane/` duplicate.
+- Deleted the confirmed byte-identical `zeropoint/ray_actors/ray_actors/` duplicate.
+- Validation passed: Ruff reported 0 errors, Black left 32 files unchanged, mypy was clean for `server.py`, `registry.py`, and `auth.py`, and pytest passed 249 tests.
+- Committed and pushed as `aa51ade`.
+- Pre-existing dirty edits in both duplicate directories were preserved by `git stash create` snapshot `cf1a688c60d9a8d775ce18a88039bd2a2f7d4e48`.
+
+### Base tool review
+
+- Reviewed `zeropoint/tools/base.py` end-to-end without changes.
+- `BaseTool` is a clean ABC contract with abstract `execute()`, required `name`/`description`/`module` attributes, and concrete `safe_execute()`, `require()`, and `get()` helpers.
+- No mutable class-level defaults were found; `ToolResult.metadata` correctly uses `field(default_factory=dict)`.
+- The four production subclasses (`adb.py`, `filesystem.py`, `webtools.py`, and `tools/android/tool.py`) implement compatible `execute()` methods and rely on the base constructor calling `_setup()`.
+- `safe_execute()` deliberately logs unexpected exceptions with `exc_info=True` and returns `INTERNAL_ERROR`; no bug was found.
+
+### Watch item and deferred work
+
+- `ToolAdapter` classes in `zeropoint/pentest/recon_orchestrator.py` are a separate abstraction and do not inherit `BaseTool`. No action was taken; if wired into the main registry later, they would not satisfy the registry contract of `name`/`description`/`module`, abstract `execute()`, and `safe_execute()` routing.
+- A dedicated autonomous offensive pentest MCP platform remains deferred. The investigation/scaffold prompt has not been run. HexStrike AI (150+ security tools exposed as MCP tools) and Strix (an open-source autonomous AI pentesting agent with PoC validation) were identified for evaluation before custom implementation.
+
+### ZERO-FLD health verification
+
+- In progress; the repository definition and read-only health result will be appended after the Part B check.
+
 ## 1) Mission
 
 Build a **local-first, two-node AI operations platform** that can:
